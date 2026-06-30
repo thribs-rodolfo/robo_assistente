@@ -1,0 +1,23 @@
+[package]
+name = "roteador"
+version = "0.1.0"
+edition = "2021"
+description = "Roteador de provedores — cérebro agnóstico da ponte/agente (Rust, zero dependências)."
+
+# Filosofia (ver WORKSPACE_RULES "Como escrevemos código"):
+# mínimo de dependências — aqui, ZERO. JSON, HTTP e processo são escritos à mão,
+# usando só a stdlib. Código educacional: nível mais baixo possível que faça sentido.
+[dependencies]
+
+# Biblioteca (a lógica do roteador) + binário de linha de comando para testar.
+[lib]
+name = "roteador"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roteador"
+path = "src/bin/roteador.rs"
+
+# Linters estritos: build limpo, zero warning (cargo clippy -D warnings).
+[lints.rust]
+unsafe_code = "forbid"
