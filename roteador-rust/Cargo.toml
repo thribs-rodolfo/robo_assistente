@@ -18,6 +18,11 @@ path = "src/lib.rs"
 name = "roteador"
 path = "src/bin/roteador.rs"
 
+# Ponte Telegram: servidor de webhooks que liga o Telegram ao roteador (substitui servidor.py).
+[[bin]]
+name = "ponte-telegram"
+path = "src/bin/ponte_telegram.rs"
+
 # Linters estritos: build limpo, zero warning (cargo clippy -D warnings).
 [lints.rust]
 unsafe_code = "forbid"
