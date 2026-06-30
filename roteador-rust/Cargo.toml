@@ -23,6 +23,11 @@ path = "src/bin/roteador.rs"
 name = "ponte-telegram"
 path = "src/bin/ponte_telegram.rs"
 
+# Métricas: lê o log de telemetria e imprime de quem o robô realmente depende (só leitura).
+[[bin]]
+name = "metricas"
+path = "src/bin/metricas.rs"
+
 # Linters estritos: build limpo, zero warning (cargo clippy -D warnings).
 [lints.rust]
 unsafe_code = "forbid"

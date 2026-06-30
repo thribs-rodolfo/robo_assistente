@@ -50,10 +50,12 @@ e citar o nome na `ordem_fallback`.
 | `config.rs`     | Lê a config JSON dos provedores (fora do repo)                  |
 | `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini             |
 | `telemetria.rs` | Log de quem respondeu e por que caiu                            |
+| `metricas.rs`   | Lê o log e agrega: de quem o robô realmente depende             |
 | `lib.rs`        | `rotear()` — a cadeia de fallback                               |
 | `servidor_http.rs` | Servidor HTTP/1.1 cru (parse de requisição + resposta)       |
 | `ponte.rs`      | Ponte Telegram: config dos bots, allowFrom, `sendMessage`, processar |
 | `bin/ponte-telegram` | Servidor de webhooks que liga o Telegram ao `rotear()`     |
+| `bin/metricas`  | Lê o log de telemetria e imprime as métricas (só leitura)       |
 
 ## Config
 
@@ -83,6 +85,29 @@ cargo build --release
 # [provedor: ollama_local]
 # Paris.
 ```
+
+## Métricas (`bin/metricas`)
+
+O `rotear()` só ANEXA linhas cruas ao log (`/var/log/roteador-provedores.log`).
+O `bin/metricas` faz o caminho inverso: LÊ o log e responde **"de quem o robô
+realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar à vontade.
+
+```sh
+./target/release/metricas                    # log padrão
+./target/release/metricas /outro/caminho.log # outro arquivo
+# == Métricas do roteador de provedores ==
+# - groq: 0 ok, 9 falha, 1 pulo, 0 cfg | —
+# - ollama_local: 3 ok, 10 falha, 0 pulo, 0 cfg | 1233ms média
+# total de roteamentos: 3
+# caiu no piso (Ollama): 3 de 3 (100.0%)
+```
+
+A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
+mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
+
+> Nota: linhas no formato ANTIGO do roteador Python (`... ,177 INFO [roteador]
+> respondido por '...'`) são **ignoradas de propósito** (schema diferente) e contadas
+> em "linhas ignoradas" — sem truncar em silêncio. A telemetria nova é toda em Rust.
 
 ## Ponte Telegram (`bin/ponte-telegram`)
 

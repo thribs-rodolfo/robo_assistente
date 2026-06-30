@@ -14,6 +14,7 @@ pub mod erro;
 pub mod http;
 pub mod https;
 pub mod json;
+pub mod metricas;
 pub mod ponte;
 pub mod prompt;
 pub mod provedor;
