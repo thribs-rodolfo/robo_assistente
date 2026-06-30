@@ -28,6 +28,17 @@ const ENDERECO_PADRAO: &str = "127.0.0.1:18800";
 /// Cabeçalho onde o Telegram envia o secret do webhook.
 const CABECALHO_SECRET: &str = "X-Telegram-Bot-Api-Secret-Token";
 
+/// Caminho da config dos bots: env `PONTE_CONFIG` ou o padrão (em `/root/.secrets/`).
+/// Sobrescrever é útil em testes (apontar para uma config descartável) sem mexer na produção.
+fn caminho_config_bots() -> String {
+    std::env::var("PONTE_CONFIG").unwrap_or_else(|_| ponte::CAMINHO_CONFIG_PADRAO.to_string())
+}
+
+/// Caminho da config do roteador (provedores): env `ROTEADOR_CONFIG` ou o padrão.
+fn caminho_config_roteador() -> String {
+    std::env::var("ROTEADOR_CONFIG").unwrap_or_else(|_| CAMINHO_PADRAO.to_string())
+}
+
 fn main() {
     let endereco = std::env::var("PONTE_ENDERECO").unwrap_or_else(|_| ENDERECO_PADRAO.to_string());
     ponte::registrar(&format!("ponte-telegram (Rust) iniciando em {endereco}"));
@@ -105,7 +116,7 @@ fn rotear_requisicao(req: &Requisicao) -> (Resposta, Option<Box<dyn FnOnce() + S
     };
 
     // Carrega a config dos bots a cada requisição (permite editar secrets sem reiniciar).
-    let bots = match ponte::carregar_config(ponte::CAMINHO_CONFIG_PADRAO) {
+    let bots = match ponte::carregar_config(&caminho_config_bots()) {
         Ok(b) => b,
         Err(erro) => {
             ponte::registrar(&format!("config dos bots ilegível: {erro}"));
@@ -127,7 +138,7 @@ fn rotear_requisicao(req: &Requisicao) -> (Resposta, Option<Box<dyn FnOnce() + S
 
     // Carrega a config do roteador (provedores). Se falhar, ainda respondemos 200 ao
     // Telegram (não queremos reentregas), mas registramos e não processamos.
-    let config_roteador = match carregar_de_arquivo(CAMINHO_PADRAO) {
+    let config_roteador = match carregar_de_arquivo(&caminho_config_roteador()) {
         Ok(c) => c,
         Err(erro) => {
             ponte::registrar(&format!(
