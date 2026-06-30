@@ -95,6 +95,23 @@ impl Severidade {
     }
 }
 
+/// Passo (em pontos percentuais) entre níveis de severidade do alarme PERCENTUAL: a cada
+/// `PASSO_SEVERIDADE_PERCENTUAL` pontos acima do limiar a gravidade sobe um nível. Com limiar
+/// 70 e passo 10: ATENÇÃO 70–79%, ALERTA 80–89%, CRÍTICO ≥ 90% (quase tudo caindo no piso).
+pub const PASSO_SEVERIDADE_PERCENTUAL: u64 = 10;
+
+/// Mapeia um "nível" (0 = nenhum, 1, 2, 3+) para a severidade correspondente. Privado, usado
+/// pelos dois classificadores ([`severidade`] e [`severidade_percentual`]) para não duplicar a
+/// escada ATENÇÃO/ALERTA/CRÍTICO.
+fn nivel_para_severidade(nivel: u64) -> Severidade {
+    match nivel {
+        0 => Severidade::Normal,
+        1 => Severidade::Atencao,
+        2 => Severidade::Alerta,
+        _ => Severidade::Critico,
+    }
+}
+
 /// Classifica a gravidade de uma sequência de quedas no piso em função do `limite`.
 ///
 /// Conta quantos degraus inteiros de `limite` cabem na sequência: `[limite, 2*limite)` é o
@@ -102,12 +119,20 @@ impl Severidade {
 /// Abaixo do limite não é alarme (NORMAL). `limite` 0 é tratado como 1 (igual a [`decidir`]).
 pub fn severidade(sequencia: u64, limite: u64) -> Severidade {
     let limite = limite.max(1);
-    match sequencia / limite {
-        0 => Severidade::Normal,
-        1 => Severidade::Atencao,
-        2 => Severidade::Alerta,
-        _ => Severidade::Critico,
+    nivel_para_severidade(sequencia / limite)
+}
+
+/// Classifica a gravidade do alarme PERCENTUAL pela distância acima do limiar, em passos de
+/// [`PASSO_SEVERIDADE_PERCENTUAL`] pontos. Abaixo do limiar é NORMAL (não é alarme); no limiar
+/// já é ATENÇÃO, e cada passo acima sobe um nível até CRÍTICO. Mantém a MESMA escada visual do
+/// alarme de sequência, então as duas mensagens "falam a mesma língua" de gravidade para o Thiago.
+pub fn severidade_percentual(percentual_no_piso: u64, limiar: u8) -> Severidade {
+    let limiar = limiar as u64;
+    if percentual_no_piso < limiar {
+        return Severidade::Normal;
     }
+    let passos_acima = (percentual_no_piso - limiar) / PASSO_SEVERIDADE_PERCENTUAL;
+    nivel_para_severidade(passos_acima + 1)
 }
 
 /// Margem de histerese (em pontos percentuais) do alarme percentual. Depois de alertar que
@@ -205,12 +230,20 @@ pub fn mensagem_alerta_percentual(
     let piso = relatorio.sucessos_no_piso();
     let total = relatorio.total_roteamentos();
     let pct = relatorio.percentual_no_piso();
+    // Percentual em inteiro (mesma conta de `decidir_por_percentual`) para a severidade não
+    // depender de arredondamento de float na fronteira dos passos.
+    let pct_inteiro = if total == 0 {
+        0
+    } else {
+        (piso as u128 * 100 / total as u128) as u64
+    };
+    let etiqueta = severidade_percentual(pct_inteiro, limiar_percentual).etiqueta();
     let periodo = match janela {
         Some(j) => format!("nas últimas {j}"),
         None => "em todo o histórico".to_string(),
     };
     format!(
-        "⚠️ Roteador: {pct:.0}% dos roteamentos {periodo} caíram no piso (Ollama) — \
+        "{etiqueta} Roteador: {pct:.0}% dos roteamentos {periodo} caíram no piso (Ollama) — \
          {piso} de {total} (limiar de alerta: {limiar_percentual}%).\n\
          Mesmo sem quedas longas em série, a dependência do modelo local fraco está alta: \
          a cadeia de provedores bons (Claude/Groq/Gemini) está respondendo pouco.\n\
@@ -483,6 +516,35 @@ mod testes {
         assert_eq!(severidade(6, 3), Severidade::Alerta);
         assert!(decidir(9, 3, 6).notificar);
         assert_eq!(severidade(9, 3), Severidade::Critico);
+    }
+
+    #[test]
+    fn severidade_percentual_escalona_por_passo() {
+        // Limiar 70, passo 10: abaixo do limiar é NORMAL.
+        assert_eq!(severidade_percentual(69, 70), Severidade::Normal);
+        // [70, 80): ATENÇÃO.
+        assert_eq!(severidade_percentual(70, 70), Severidade::Atencao);
+        assert_eq!(severidade_percentual(79, 70), Severidade::Atencao);
+        // [80, 90): ALERTA.
+        assert_eq!(severidade_percentual(80, 70), Severidade::Alerta);
+        assert_eq!(severidade_percentual(89, 70), Severidade::Alerta);
+        // >= 90: CRÍTICO (quase tudo no piso).
+        assert_eq!(severidade_percentual(90, 70), Severidade::Critico);
+        assert_eq!(severidade_percentual(100, 70), Severidade::Critico);
+    }
+
+    #[test]
+    fn mensagem_percentual_abre_com_severidade() {
+        // 3 de 4 = 75% (>= limiar 70, primeiro passo) -> ATENÇÃO abre a mensagem.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 31000ms
+2026-06-30 12:03:00 UTC [roteador] [ok] respondido por 'ollama_local' em 32000ms
+";
+        let relatorio = crate::metricas::agregar(log);
+        let msg = mensagem_alerta_percentual(&relatorio, 70, Some("24h"));
+        assert!(msg.starts_with("🟡 ATENÇÃO"));
     }
 
     #[test]

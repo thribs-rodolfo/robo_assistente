@@ -136,7 +136,10 @@ São **dois alarmes ortogonais** sobre o mesmo log, cada um com seu anti-spam:
    de sequência deixa passar. Anti-spam com **histerese**: avisa ao cruzar o limiar, fica quieto
    enquanto continua alto e só re-arma quando a fração cai com folga (`limiar − 15` pontos),
    evitando ligar/desligar na fronteira. Exige um **mínimo de amostras** para não alertar com
-   pouca evidência (ex.: "1 de 1 = 100%").
+   pouca evidência (ex.: "1 de 1 = 100%"). Também **escalonado por severidade**
+   (`alerta::severidade_percentual`), a cada 10 pontos acima do limiar: 🟡 **ATENÇÃO** (70–79%) →
+   🟠 **ALERTA** (80–89%) → 🔴 **CRÍTICO** (≥ 90%). Mesma escada visual do alarme de sequência,
+   então as duas mensagens "falam a mesma língua" de gravidade.
 
 Ambos só LÊEM o log — nunca disparam provedor → não tocam o Claude.
 

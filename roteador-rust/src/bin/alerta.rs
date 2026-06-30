@@ -139,12 +139,20 @@ fn rodar_alarme_percentual(opcoes: &Opcoes, relatorio: &metricas::Relatorio) -> 
         opcoes.minimo_amostras,
         ja_em_alta,
     );
+    // Percentual inteiro (mesma conta da decisão) para classificar a severidade.
+    let pct_inteiro = if total == 0 {
+        0
+    } else {
+        (piso as u128 * 100 / total as u128) as u64
+    };
+    let severidade = alerta::severidade_percentual(pct_inteiro, opcoes.limiar_percentual);
     println!(
         "[alerta] pct_no_piso={:.0}% ({piso}/{total}) limiar={}% min_amostras={} \
-         ja_em_alta={ja_em_alta} -> notificar={} novo_estado={}",
+         ja_em_alta={ja_em_alta} severidade={} -> notificar={} novo_estado={}",
         relatorio.percentual_no_piso(),
         opcoes.limiar_percentual,
         opcoes.minimo_amostras,
+        severidade.etiqueta(),
         decisao.notificar,
         decisao.ja_em_alta
     );
