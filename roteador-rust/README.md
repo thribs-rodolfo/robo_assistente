@@ -124,7 +124,12 @@ São **dois alarmes ortogonais** sobre o mesmo log, cada um com seu anti-spam:
 1. **Sequência** — quedas no piso **SEGUIDAS** (cadeia de cima falhando em série AGORA).
    Função pura `alerta::decidir`. Anti-spam por arquivo de estado: avisa **uma vez por
    rajada** e de novo só quando piora um degrau inteiro (mais `limite` quedas). Quando um
-   provedor bom responde, a sequência zera e o estado é limpo.
+   provedor bom responde, a sequência zera e o estado é limpo. A mensagem é **escalonada por
+   severidade** (`alerta::severidade`): cada degrau de `limite` quedas sobe o nível —
+   🟡 **ATENÇÃO** (`[limite, 2×limite)`) → 🟠 **ALERTA** (`[2×limite, 3×limite)`) →
+   🔴 **CRÍTICO** (`≥ 3×limite`). Como o re-alerta também dispara a cada degrau, cada nova
+   notificação chega com a gravidade mais alta que a anterior — o Thiago vê a degradação
+   crescer mensagem a mensagem, sem flood.
 2. **Percentual** — **fração alta** de quedas no piso na janela, *mesmo sem quedas em série*
    (cadeia falhando de forma intermitente mas pesada — ex.: 8 de 10 roteamentos no piso, sem
    nunca acumular 5 seguidas). Função pura `alerta::decidir_por_percentual`. Pega o que o alarme
@@ -138,7 +143,7 @@ Ambos só LÊEM o log — nunca disparam provedor → não tocam o Claude.
 ```sh
 ./target/release/alerta --simular              # decide e imprime, NÃO manda Telegram nem grava estado
 ./target/release/alerta --limite 5 --limiar-percentual 70 --janela 24h
-# [alerta] seq_no_piso=3 limite=5 ja_alertado=0 -> notificar=false novo_estado=0
+# [alerta] seq_no_piso=3 limite=5 ja_alertado=0 severidade=NORMAL -> notificar=false novo_estado=0
 # [alerta] pct_no_piso=100% (3/3) limiar=70% min_amostras=8 ja_em_alta=false -> notificar=false novo_estado=false
 ```
 

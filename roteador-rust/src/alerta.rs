@@ -64,6 +64,52 @@ pub fn decidir(sequencia_atual: u64, limite: u64, ja_alertado: u64) -> Decisao {
     }
 }
 
+/// Severidade ESCALONADA do alarme de sequência. Conforme as quedas seguidas no piso passam
+/// de múltiplos do `limite`, a gravidade sobe — dando ao Thiago uma triagem rápida sem precisar
+/// ler o número: 🟡 ATENÇÃO (começou) < 🟠 ALERTA (piorou) < 🔴 CRÍTICO (dependência prolongada).
+///
+/// O escalonamento casa de propósito com o anti-spam por degraus de [`decidir`]: como cada
+/// re-alerta dispara ao acumular mais `limite` quedas, cada subida de nível tende a coincidir
+/// com uma nova notificação — o Thiago vê a gravidade crescer mensagem a mensagem, sem flood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severidade {
+    /// Abaixo do limite — não é alarme (cadeia saudável ou rajada curta).
+    Normal,
+    /// Primeiro degrau: `[limite, 2*limite)`. Primeiro sinal de degradação em série.
+    Atencao,
+    /// Segundo degrau: `[2*limite, 3*limite)`. Cadeia de cima claramente comprometida.
+    Alerta,
+    /// Terceiro degrau ou mais: `>= 3*limite`. Dependência prolongada do piso fraco.
+    Critico,
+}
+
+impl Severidade {
+    /// Etiqueta legível (com emoji de cor) para abrir a mensagem ao Thiago e os logs.
+    pub fn etiqueta(self) -> &'static str {
+        match self {
+            Severidade::Normal => "NORMAL",
+            Severidade::Atencao => "🟡 ATENÇÃO",
+            Severidade::Alerta => "🟠 ALERTA",
+            Severidade::Critico => "🔴 CRÍTICO",
+        }
+    }
+}
+
+/// Classifica a gravidade de uma sequência de quedas no piso em função do `limite`.
+///
+/// Conta quantos degraus inteiros de `limite` cabem na sequência: `[limite, 2*limite)` é o
+/// primeiro (ATENÇÃO), `[2*limite, 3*limite)` o segundo (ALERTA), daí em diante CRÍTICO.
+/// Abaixo do limite não é alarme (NORMAL). `limite` 0 é tratado como 1 (igual a [`decidir`]).
+pub fn severidade(sequencia: u64, limite: u64) -> Severidade {
+    let limite = limite.max(1);
+    match sequencia / limite {
+        0 => Severidade::Normal,
+        1 => Severidade::Atencao,
+        2 => Severidade::Alerta,
+        _ => Severidade::Critico,
+    }
+}
+
 /// Margem de histerese (em pontos percentuais) do alarme percentual. Depois de alertar que
 /// a fração no piso passou do limiar, só consideramos "recuperado" quando ela cair a
 /// `limiar - MARGEM` ou menos. Sem essa folga, um percentual oscilando bem na fronteira do
@@ -139,8 +185,9 @@ pub fn mensagem_alerta(relatorio: &Relatorio, limite: u64) -> String {
     let seq = relatorio.sequencia_atual_no_piso;
     let piso = relatorio.sucessos_no_piso();
     let total = relatorio.total_roteamentos();
+    let etiqueta = severidade(seq, limite).etiqueta();
     format!(
-        "⚠️ Roteador: caí no piso (Ollama) {seq}x SEGUIDAS (limite de alerta: {limite}).\n\
+        "{etiqueta} Roteador: caí no piso (Ollama) {seq}x SEGUIDAS (limite de alerta: {limite}).\n\
          A cadeia de provedores bons (Claude/Groq/Gemini) está falhando em série — o robô \
          está respondendo só pelo modelo local fraco.\n\
          Verifique: token do Claude (refresh) e chaves Groq/Gemini.\n\
@@ -392,8 +439,57 @@ mod testes {
 ";
         let relatorio = crate::metricas::agregar(log);
         let msg = mensagem_alerta(&relatorio, 3);
+        // 4 quedas, limite 3 -> primeiro degrau -> ATENÇÃO abre a mensagem.
+        assert!(msg.starts_with("🟡 ATENÇÃO"));
         assert!(msg.contains("4x SEGUIDAS"));
         assert!(msg.contains("limite de alerta: 3"));
         assert!(msg.contains("4 de 4"));
+    }
+
+    #[test]
+    fn severidade_escalona_por_degrau() {
+        // Limite 3: abaixo do limite é NORMAL (não é alarme).
+        assert_eq!(severidade(0, 3), Severidade::Normal);
+        assert_eq!(severidade(2, 3), Severidade::Normal);
+        // Primeiro degrau [3, 6): ATENÇÃO.
+        assert_eq!(severidade(3, 3), Severidade::Atencao);
+        assert_eq!(severidade(5, 3), Severidade::Atencao);
+        // Segundo degrau [6, 9): ALERTA.
+        assert_eq!(severidade(6, 3), Severidade::Alerta);
+        assert_eq!(severidade(8, 3), Severidade::Alerta);
+        // Terceiro degrau ou mais (>= 9): CRÍTICO.
+        assert_eq!(severidade(9, 3), Severidade::Critico);
+        assert_eq!(severidade(100, 3), Severidade::Critico);
+    }
+
+    #[test]
+    fn severidade_limite_zero_tratado_como_um() {
+        // Igual a `decidir`: limite 0 vira 1. 1 queda já é o primeiro degrau (ATENÇÃO),
+        // 2 o segundo (ALERTA), 3+ CRÍTICO.
+        assert_eq!(severidade(0, 0), Severidade::Normal);
+        assert_eq!(severidade(1, 0), Severidade::Atencao);
+        assert_eq!(severidade(2, 0), Severidade::Alerta);
+        assert_eq!(severidade(3, 0), Severidade::Critico);
+    }
+
+    #[test]
+    fn severidade_acompanha_os_realertas_por_degrau() {
+        // O escalonamento deve subir EXATAMENTE quando `decidir` re-alerta um novo degrau,
+        // para cada notificação levar uma severidade maior que a anterior. Limite 3:
+        // alerta em 3 (ATENÇÃO), re-alerta em 6 (ALERTA) e em 9 (CRÍTICO).
+        assert!(decidir(3, 3, 0).notificar);
+        assert_eq!(severidade(3, 3), Severidade::Atencao);
+        assert!(decidir(6, 3, 3).notificar);
+        assert_eq!(severidade(6, 3), Severidade::Alerta);
+        assert!(decidir(9, 3, 6).notificar);
+        assert_eq!(severidade(9, 3), Severidade::Critico);
+    }
+
+    #[test]
+    fn etiquetas_de_severidade() {
+        assert_eq!(Severidade::Normal.etiqueta(), "NORMAL");
+        assert_eq!(Severidade::Atencao.etiqueta(), "🟡 ATENÇÃO");
+        assert_eq!(Severidade::Alerta.etiqueta(), "🟠 ALERTA");
+        assert_eq!(Severidade::Critico.etiqueta(), "🔴 CRÍTICO");
     }
 }

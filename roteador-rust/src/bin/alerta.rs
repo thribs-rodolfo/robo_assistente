@@ -92,10 +92,14 @@ fn rodar_alarme_sequencia(opcoes: &Opcoes, relatorio: &metricas::Relatorio) -> R
     let ja_alertado = ler_estado_tolerante(&opcoes.caminho_estado)?;
     let sequencia = relatorio.sequencia_atual_no_piso;
     let decisao = alerta::decidir(sequencia, opcoes.limite, ja_alertado);
+    let severidade = alerta::severidade(sequencia, opcoes.limite);
     println!(
         "[alerta] seq_no_piso={sequencia} limite={} ja_alertado={ja_alertado} \
-         -> notificar={} novo_estado={}",
-        opcoes.limite, decisao.notificar, decisao.novo_estado
+         severidade={} -> notificar={} novo_estado={}",
+        opcoes.limite,
+        severidade.etiqueta(),
+        decisao.notificar,
+        decisao.novo_estado
     );
 
     if opcoes.simular {
