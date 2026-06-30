@@ -46,6 +46,12 @@ pub struct Relatorio {
     pub por_provedor: BTreeMap<String, MetricasProvedor>,
     /// Linhas que não casaram com nenhum padrão conhecido (ruído/formato antigo).
     pub linhas_ignoradas: u64,
+    /// Quantos dos roteamentos MAIS RECENTES, em sequência, caíram no piso (Ollama).
+    /// Zera assim que um provedor bom responde. É o alarme de "estou sem provedor bom AGORA":
+    /// se está alto, a cadeia toda de cima vem falhando em série.
+    pub sequencia_atual_no_piso: u64,
+    /// A maior sequência de roteamentos seguidos no piso já vista no período analisado.
+    pub maior_sequencia_no_piso: u64,
 }
 
 impl Relatorio {
@@ -60,10 +66,28 @@ impl Relatorio {
     pub fn sucessos_no_piso(&self) -> u64 {
         self.por_provedor
             .iter()
-            .filter(|(nome, _)| nome.to_lowercase().contains("ollama"))
+            .filter(|(nome, _)| eh_piso(nome))
             .map(|(_, m)| m.sucessos)
             .sum()
     }
+
+    /// Atualiza as sequências de "caiu no piso" a cada `[ok]`, na ordem cronológica do log.
+    /// Cada resposta de provedor bom zera a sequência atual; cada Ollama soma +1.
+    fn registrar_sequencia(&mut self, nome: &str) {
+        if eh_piso(nome) {
+            self.sequencia_atual_no_piso += 1;
+            if self.sequencia_atual_no_piso > self.maior_sequencia_no_piso {
+                self.maior_sequencia_no_piso = self.sequencia_atual_no_piso;
+            }
+        } else {
+            self.sequencia_atual_no_piso = 0;
+        }
+    }
+}
+
+/// Um provedor é o "piso" se o nome contém "ollama" (case-insensitive). Único ponto de decisão.
+fn eh_piso(nome: &str) -> bool {
+    nome.to_lowercase().contains("ollama")
 }
 
 /// Lê o arquivo de log e agrega tudo. Devolve `Err` se não conseguir ler (sem erro silencioso).
@@ -72,15 +96,42 @@ pub fn agregar_de_arquivo(caminho: &str) -> Result<Relatorio, std::io::Error> {
     Ok(agregar(&conteudo))
 }
 
-/// Agrega o conteúdo bruto do log (várias linhas) em um [`Relatorio`].
+/// Igual a [`agregar_de_arquivo`], mas só conta o que aconteceu nos últimos
+/// `janela_segundos` antes de `agora_epoch` (ex.: 24h). Linhas sem timestamp ou fora
+/// da janela são simplesmente ignoradas na soma (não contam como ruído).
+pub fn agregar_janela_de_arquivo(
+    caminho: &str,
+    agora_epoch: u64,
+    janela_segundos: u64,
+) -> Result<Relatorio, std::io::Error> {
+    let conteudo = std::fs::read_to_string(caminho)?;
+    Ok(agregar_janela(&conteudo, agora_epoch, janela_segundos))
+}
+
+/// Agrega o conteúdo bruto do log (várias linhas) em um [`Relatorio`] — tudo, sem recorte.
 ///
 /// Função pura: recebe o texto inteiro, devolve as contagens. Toda a lógica de parsing
 /// é testável sem tocar em disco.
 pub fn agregar(conteudo: &str) -> Relatorio {
+    agregar_interno(conteudo, None)
+}
+
+/// Agrega só as linhas dentro da janela `[agora_epoch - janela_segundos, agora_epoch]`.
+///
+/// Útil para responder "nas últimas 24h, de quem o robô dependeu?" sem o peso do histórico
+/// inteiro. Linhas anteriores à janela (ou sem timestamp legível) ficam de fora da soma.
+pub fn agregar_janela(conteudo: &str, agora_epoch: u64, janela_segundos: u64) -> Relatorio {
+    let inicio = agora_epoch.saturating_sub(janela_segundos);
+    agregar_interno(conteudo, Some(inicio..=agora_epoch))
+}
+
+/// Núcleo compartilhado: percorre as linhas em ordem e soma os eventos. Se `janela` for
+/// `Some(faixa)`, só conta linhas cujo timestamp está dentro da faixa (epoch UTC).
+fn agregar_interno(conteudo: &str, janela: Option<std::ops::RangeInclusive<u64>>) -> Relatorio {
     let mut relatorio = Relatorio::default();
     for linha in conteudo.lines() {
-        let corpo = match corpo_da_linha(linha) {
-            Some(c) => c,
+        let (carimbo, corpo) = match separar_linha(linha) {
+            Some(par) => par,
             None => {
                 if !linha.trim().is_empty() {
                     relatorio.linhas_ignoradas += 1;
@@ -88,8 +139,21 @@ pub fn agregar(conteudo: &str) -> Relatorio {
                 continue;
             }
         };
+        // Recorte por janela: sem timestamp legível ou fora da faixa -> não entra na soma.
+        if let Some(faixa) = &janela {
+            match carimbo {
+                Some(instante) if faixa.contains(&instante) => {}
+                _ => continue,
+            }
+        }
         match classificar(corpo) {
-            Some(evento) => evento.aplicar(&mut relatorio.por_provedor),
+            Some(evento) => {
+                // A sequência de piso só faz sentido para roteamentos concluídos (`[ok]`).
+                if let Evento::Sucesso { nome, .. } = &evento {
+                    relatorio.registrar_sequencia(nome);
+                }
+                evento.aplicar(&mut relatorio.por_provedor);
+            }
             None => relatorio.linhas_ignoradas += 1,
         }
     }
@@ -127,9 +191,11 @@ impl Evento {
 /// `YYYY-MM-DD HH:MM:SS UTC [roteador] <corpo>`.
 const MARCADOR: &str = " [roteador] ";
 
-/// Extrai o corpo da mensagem (tudo após `[roteador] `), ou `None` se a linha não casar.
-fn corpo_da_linha(linha: &str) -> Option<&str> {
-    linha.split_once(MARCADOR).map(|(_data, corpo)| corpo)
+/// Separa a linha em (instante, corpo): o carimbo vira epoch UTC (ou `None` se ilegível)
+/// e o corpo é tudo após `[roteador] `. Devolve `None` só quando o marcador nem existe.
+fn separar_linha(linha: &str) -> Option<(Option<u64>, &str)> {
+    let (data, corpo) = linha.split_once(MARCADOR)?;
+    Some((crate::telemetria::epoch_de_data_utc(data), corpo))
 }
 
 /// Interpreta o corpo de uma linha em um [`Evento`], ou `None` se for formato desconhecido.
@@ -222,6 +288,12 @@ impl std::fmt::Display for Relatorio {
             0.0
         };
         writeln!(f, "caiu no piso (Ollama): {piso} de {total} ({pct:.1}%)")?;
+        // Sequências de piso: alarme de dependência AGORA (atual) e pior momento (máxima).
+        writeln!(
+            f,
+            "sequência no piso: {} agora (máx. {})",
+            self.sequencia_atual_no_piso, self.maior_sequencia_no_piso
+        )?;
         if self.linhas_ignoradas > 0 {
             writeln!(f, "(linhas ignoradas: {})", self.linhas_ignoradas)?;
         }
@@ -234,13 +306,21 @@ mod testes {
     use super::*;
 
     #[test]
-    fn extrai_corpo_depois_do_marcador() {
+    fn separa_carimbo_e_corpo_depois_do_marcador() {
         let linha = "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama' em 33ms";
+        let (carimbo, corpo) = separar_linha(linha).unwrap();
+        assert_eq!(corpo, "[ok] respondido por 'ollama' em 33ms");
+        // O carimbo vira epoch (mesmo instante que a telemetria gravaria).
         assert_eq!(
-            corpo_da_linha(linha),
-            Some("[ok] respondido por 'ollama' em 33ms")
+            carimbo,
+            crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC")
         );
-        assert_eq!(corpo_da_linha("linha sem marcador"), None);
+        // Sem o marcador, nem dá pra separar.
+        assert_eq!(separar_linha("linha sem marcador"), None);
+        // Com marcador mas data corrompida: separa o corpo, mas o carimbo fica None.
+        let (sem_data, corpo2) = separar_linha("lixo [roteador] [pula] groq: x").unwrap();
+        assert_eq!(sem_data, None);
+        assert_eq!(corpo2, "[pula] groq: x");
     }
 
     #[test]
@@ -307,6 +387,57 @@ linha de ruído sem formato
         assert_eq!(r.total_roteamentos(), 3); // 2 claude + 1 ollama
         assert_eq!(r.sucessos_no_piso(), 1); // só o ollama_local
         assert_eq!(r.linhas_ignoradas, 1); // a linha de ruído
+    }
+
+    #[test]
+    fn conta_sequencia_consecutiva_no_piso() {
+        // Ordem cronológica: bom, piso, piso, piso, bom, piso, piso.
+        // Maior sequência seguida = 3; a atual (no fim) = 2.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 31000ms
+2026-06-30 12:03:00 UTC [roteador] [ok] respondido por 'ollama_local' em 32000ms
+2026-06-30 12:04:00 UTC [roteador] [ok] respondido por 'claude' em 600ms
+2026-06-30 12:05:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:06:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let r = agregar(log);
+        assert_eq!(r.maior_sequencia_no_piso, 3);
+        assert_eq!(r.sequencia_atual_no_piso, 2);
+        assert!(format!("{r}").contains("sequência no piso: 2 agora (máx. 3)"));
+    }
+
+    #[test]
+    fn janela_de_tempo_recorta_o_log() {
+        // Duas linhas: uma velha (fora de 1h) e uma recente (dentro). Só a recente conta.
+        let velha = crate::telemetria::epoch_de_data_utc("2026-06-30 10:00:00 UTC").unwrap();
+        let recente = crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC").unwrap();
+        let agora = recente; // "agora" = instante da linha recente
+        let log = "\
+2026-06-30 10:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        // Janela de 1h: deixa de fora a linha das 10:00.
+        let r = agregar_janela(log, agora, 3_600);
+        assert!(!r.por_provedor.contains_key("claude"));
+        assert_eq!(r.por_provedor["ollama_local"].sucessos, 1);
+        assert_eq!(r.total_roteamentos(), 1);
+
+        // Janela larga (3h): pega as duas. Confirma que o recorte é o que muda.
+        let r3h = agregar_janela(log, agora, 3 * 3_600);
+        assert_eq!(r3h.total_roteamentos(), 2);
+        let _ = velha; // documentado: linha velha existe, só foi recortada na janela de 1h
+    }
+
+    #[test]
+    fn linha_sem_timestamp_legivel_fica_fora_da_janela() {
+        // Timestamp corrompido -> não dá pra situar no tempo -> não entra na visão por janela.
+        let log = "data-quebrada [roteador] [ok] respondido por 'claude' em 500ms\n";
+        let r = agregar_janela(log, 2_000_000_000, 86_400);
+        assert_eq!(r.total_roteamentos(), 0);
+        // Mas no agregado completo (sem janela) ela conta normalmente.
+        assert_eq!(agregar(log).total_roteamentos(), 1);
     }
 
     #[test]

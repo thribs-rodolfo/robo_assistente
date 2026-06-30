@@ -93,17 +93,28 @@ O `bin/metricas` faz o caminho inverso: LÊ o log e responde **"de quem o robô
 realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar à vontade.
 
 ```sh
-./target/release/metricas                    # log padrão
+./target/release/metricas                    # log padrão, agrega TUDO
 ./target/release/metricas /outro/caminho.log # outro arquivo
+./target/release/metricas --janela 24h       # só as últimas 24h (aceita 90m, 24h, 7d)
 # == Métricas do roteador de provedores ==
 # - groq: 0 ok, 9 falha, 1 pulo, 0 cfg | —
 # - ollama_local: 3 ok, 10 falha, 0 pulo, 0 cfg | 1233ms média
 # total de roteamentos: 3
 # caiu no piso (Ollama): 3 de 3 (100.0%)
+# sequência no piso: 3 agora (máx. 3)
 ```
 
-A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
-mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
+Duas linhas-chave de dependência:
+
+- **caiu no piso (Ollama)**: % de respostas que sobraram pro piso. Quanto maior, mais o
+  robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
+- **sequência no piso**: quantas respostas seguidas (as mais recentes, e a pior já vista)
+  caíram no piso. `agora` alto = a cadeia de cima está falhando AGORA, em série — alarme
+  mais forte que o % acumulado, que dilui um apagão recente no histórico inteiro.
+
+A flag **`--janela`** recorta o log por tempo (ex.: `24h`, `90m`, `7d`, ou segundos crus),
+respondendo "nas últimas 24h, de quem dependi?" sem o peso do histórico todo. Linhas sem
+timestamp legível (formato antigo) ficam de fora da visão por janela.
 
 > Nota: linhas no formato ANTIGO do roteador Python (`... ,177 INFO [roteador]
 > respondido por '...'`) são **ignoradas de propósito** (schema diferente) e contadas
