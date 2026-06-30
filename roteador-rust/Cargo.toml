@@ -28,6 +28,11 @@ path = "src/bin/ponte_telegram.rs"
 name = "metricas"
 path = "src/bin/metricas.rs"
 
+# Alerta: lê a telemetria e avisa o Thiago quando o robô cai no piso (Ollama) N vezes seguidas.
+[[bin]]
+name = "alerta"
+path = "src/bin/alerta.rs"
+
 # Linters estritos: build limpo, zero warning (cargo clippy -D warnings).
 [lints.rust]
 unsafe_code = "forbid"

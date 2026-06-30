@@ -16,6 +16,7 @@
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use roteador::duracao::{descrever_duracao, parsear_duracao};
 use roteador::metricas;
 use roteador::telemetria;
 
@@ -104,41 +105,6 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
     })
 }
 
-/// Converte "24h", "90m", "7d" ou "3600" (segundos) em segundos. `Err` se não casar.
-fn parsear_duracao(texto: &str) -> Result<u64, String> {
-    let texto = texto.trim();
-    if texto.is_empty() {
-        return Err("duração vazia".to_string());
-    }
-    // Último caractere pode ser a unidade (s/m/h/d); sem unidade = segundos.
-    let (numero, multiplicador) = match texto.chars().last() {
-        Some('s') => (&texto[..texto.len() - 1], 1),
-        Some('m') => (&texto[..texto.len() - 1], 60),
-        Some('h') => (&texto[..texto.len() - 1], 3_600),
-        Some('d') => (&texto[..texto.len() - 1], 86_400),
-        _ => (texto, 1),
-    };
-    let quantidade: u64 = numero
-        .parse()
-        .map_err(|_| format!("duração inválida: '{texto}' (use ex.: 24h, 90m, 7d, 3600)"))?;
-    quantidade
-        .checked_mul(multiplicador)
-        .ok_or_else(|| format!("duração grande demais: '{texto}'"))
-}
-
-/// Descrição curta de uma duração em segundos, para a linha de cabeçalho.
-fn descrever_duracao(segundos: u64) -> String {
-    if segundos.is_multiple_of(86_400) {
-        format!("{}d", segundos / 86_400)
-    } else if segundos.is_multiple_of(3_600) {
-        format!("{}h", segundos / 3_600)
-    } else if segundos.is_multiple_of(60) {
-        format!("{}min", segundos / 60)
-    } else {
-        format!("{segundos}s")
-    }
-}
-
 /// Instante atual em epoch (segundos UTC), ou `None` se o relógio estiver antes de 1970.
 fn agora_epoch() -> Option<u64> {
     SystemTime::now()
@@ -150,22 +116,6 @@ fn agora_epoch() -> Option<u64> {
 #[cfg(test)]
 mod testes {
     use super::*;
-
-    #[test]
-    fn parseia_duracoes_com_unidade() {
-        assert_eq!(parsear_duracao("24h"), Ok(86_400));
-        assert_eq!(parsear_duracao("90m"), Ok(5_400));
-        assert_eq!(parsear_duracao("7d"), Ok(604_800));
-        assert_eq!(parsear_duracao("45s"), Ok(45));
-        assert_eq!(parsear_duracao("3600"), Ok(3_600)); // sem unidade = segundos
-    }
-
-    #[test]
-    fn rejeita_duracoes_invalidas() {
-        assert!(parsear_duracao("").is_err());
-        assert!(parsear_duracao("abc").is_err());
-        assert!(parsear_duracao("12x").is_err());
-    }
 
     #[test]
     fn interpreta_caminho_e_janela_em_qualquer_ordem() {
@@ -191,13 +141,5 @@ mod testes {
         assert!(interpretar_argumentos(&["--janela".into()]).is_err()); // sem valor
         assert!(interpretar_argumentos(&["--xpto".into()]).is_err()); // opção desconhecida
         assert!(interpretar_argumentos(&["a".into(), "b".into()]).is_err()); // dois caminhos
-    }
-
-    #[test]
-    fn descreve_duracao_legivel() {
-        assert_eq!(descrever_duracao(86_400), "1d");
-        assert_eq!(descrever_duracao(21_600), "6h");
-        assert_eq!(descrever_duracao(5_400), "90min");
-        assert_eq!(descrever_duracao(45), "45s");
     }
 }

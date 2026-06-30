@@ -9,7 +9,9 @@
 //! processo escritos à mão na stdlib), agnóstico (trait [`Provedor`]), testável, erros
 //! tipados com `Result`, sem `unwrap`/`panic` em produção, telemetria clara.
 
+pub mod alerta;
 pub mod config;
+pub mod duracao;
 pub mod erro;
 pub mod http;
 pub mod https;

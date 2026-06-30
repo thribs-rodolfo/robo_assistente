@@ -51,11 +51,14 @@ e citar o nome na `ordem_fallback`.
 | `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini             |
 | `telemetria.rs` | Log de quem respondeu e por que caiu                            |
 | `metricas.rs`   | Lê o log e agrega: de quem o robô realmente depende             |
+| `alerta.rs`     | Decide (função pura) quando avisar o Thiago que caiu no piso    |
+| `duracao.rs`    | Converte durações legíveis ("24h", "90m") <-> segundos          |
 | `lib.rs`        | `rotear()` — a cadeia de fallback                               |
 | `servidor_http.rs` | Servidor HTTP/1.1 cru (parse de requisição + resposta)       |
 | `ponte.rs`      | Ponte Telegram: config dos bots, allowFrom, `sendMessage`, processar |
 | `bin/ponte-telegram` | Servidor de webhooks que liga o Telegram ao `rotear()`     |
 | `bin/metricas`  | Lê o log de telemetria e imprime as métricas (só leitura)       |
+| `bin/alerta`    | Avisa o Thiago quando o robô cai no piso (Ollama) N vezes seguidas |
 
 ## Config
 
@@ -93,32 +96,51 @@ O `bin/metricas` faz o caminho inverso: LÊ o log e responde **"de quem o robô
 realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar à vontade.
 
 ```sh
-./target/release/metricas                    # log padrão, agrega TUDO
+./target/release/metricas                    # log padrão
 ./target/release/metricas /outro/caminho.log # outro arquivo
-./target/release/metricas --janela 24h       # só as últimas 24h (aceita 90m, 24h, 7d)
 # == Métricas do roteador de provedores ==
 # - groq: 0 ok, 9 falha, 1 pulo, 0 cfg | —
 # - ollama_local: 3 ok, 10 falha, 0 pulo, 0 cfg | 1233ms média
 # total de roteamentos: 3
 # caiu no piso (Ollama): 3 de 3 (100.0%)
-# sequência no piso: 3 agora (máx. 3)
 ```
 
-Duas linhas-chave de dependência:
-
-- **caiu no piso (Ollama)**: % de respostas que sobraram pro piso. Quanto maior, mais o
-  robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
-- **sequência no piso**: quantas respostas seguidas (as mais recentes, e a pior já vista)
-  caíram no piso. `agora` alto = a cadeia de cima está falhando AGORA, em série — alarme
-  mais forte que o % acumulado, que dilui um apagão recente no histórico inteiro.
-
-A flag **`--janela`** recorta o log por tempo (ex.: `24h`, `90m`, `7d`, ou segundos crus),
-respondendo "nas últimas 24h, de quem dependi?" sem o peso do histórico todo. Linhas sem
-timestamp legível (formato antigo) ficam de fora da visão por janela.
+A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
+mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
 
 > Nota: linhas no formato ANTIGO do roteador Python (`... ,177 INFO [roteador]
 > respondido por '...'`) são **ignoradas de propósito** (schema diferente) e contadas
 > em "linhas ignoradas" — sem truncar em silêncio. A telemetria nova é toda em Rust.
+
+## Alerta de dependência (`bin/alerta`)
+
+As métricas a gente lê quando quer. O `bin/alerta` é o **aviso automático**: roda no cron,
+LÊ o log (nunca dispara provedor → não toca o Claude) e, quando o robô cai no piso (Ollama)
+**N vezes SEGUIDAS** — a cadeia de provedores bons falhando em série —, manda uma mensagem
+pro Thiago via `/root/notificar-thiago.sh`.
+
+A regra de "quando avisar / quando calar" é a função pura `alerta::decidir`, então é testada
+sem disco nem Telegram. **Anti-spam por arquivo de estado**: avisa **uma vez por rajada** e de
+novo só quando piora um degrau inteiro (mais `limite` quedas). Quando um provedor bom volta a
+responder, a sequência zera e o estado é limpo — a próxima rajada volta a alertar do zero.
+
+```sh
+./target/release/alerta --simular              # decide e imprime, NÃO manda Telegram nem grava estado
+./target/release/alerta --limite 5 --janela 24h
+# [alerta] seq_no_piso=3 limite=5 ja_alertado=0 -> notificar=false novo_estado=0
+```
+
+| Opção            | Default                                   | O que faz                          |
+|------------------|-------------------------------------------|------------------------------------|
+| `--limite N`     | 5                                         | quedas seguidas no piso para alertar |
+| `--janela <dur>` | (tudo)                                    | só considera as últimas `<dur>` (24h, 90m…) |
+| `--estado <p>`   | `/var/log/roteador-alerta-piso.estado`    | arquivo de estado anti-spam        |
+| `--notificador <p>` | `/root/notificar-thiago.sh`            | script que manda a mensagem        |
+| `--simular`      | —                                         | dry-run: não notifica nem grava    |
+
+No cron (`/root/alerta-piso-roteador.sh`, a cada 30min): `alerta --limite 5 --janela 24h`.
+O limite default é conservador de propósito: só incomoda o Thiago quando a degradação é clara
+e em série.
 
 ## Ponte Telegram (`bin/ponte-telegram`)
 
