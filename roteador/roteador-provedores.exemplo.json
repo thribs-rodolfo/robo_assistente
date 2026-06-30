@@ -1,0 +1,35 @@
+{
+  "_comentario": "Copie para /root/.secrets/roteador-provedores.json (chmod 600) e preencha as chaves. NUNCA versione chaves reais.",
+  "ordem_fallback": ["groq", "gemini", "claude", "ollama_local"],
+  "provedores": {
+    "claude": {
+      "tipo": "claude_cli",
+      "comando": "claude",
+      "timeout_segundos": 120,
+      "habilitado": true
+    },
+    "groq": {
+      "tipo": "openai_compat",
+      "url_base": "https://api.groq.com/openai/v1",
+      "modelo": "llama-3.1-8b-instant",
+      "chave": "COLE_AQUI_OU_USE_chave_env",
+      "chave_env": "GROQ_API_KEY",
+      "timeout_segundos": 30,
+      "habilitado": false
+    },
+    "gemini": {
+      "tipo": "gemini_rest",
+      "modelo": "gemini-1.5-flash",
+      "chave": "COLE_AQUI",
+      "timeout_segundos": 30,
+      "habilitado": false
+    },
+    "ollama_local": {
+      "tipo": "ollama",
+      "url_base": "http://127.0.0.1:11434",
+      "modelo": "qwen2.5:1.5b",
+      "timeout_segundos": 180,
+      "habilitado": true
+    }
+  }
+}
