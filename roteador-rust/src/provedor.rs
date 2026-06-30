@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::config::ConfigProvedor;
 use crate::erro::FalhaProvedor;
 use crate::http;
+use crate::https;
 use crate::json::{self, Valor};
 use crate::prompt::{self, Contexto};
 
@@ -207,13 +208,12 @@ impl Provedor for ProvedorClaudeCli {
 }
 
 // --------------------------------------------------------------------------- //
-// Slots para provedores remotos via HTTPS: Groq (API estilo OpenAI) e Gemini (REST).
+// Provedores remotos via HTTPS: Groq (API estilo OpenAI) e Gemini (REST).
 //
-// Estado atual: estão DECLARADOS e desabilitados. A chamada real depende de um cliente
-// HTTPS/TLS, que ainda não escrevemos (TLS à mão é inviável; decidiremos a abordagem —
-// crate mínima como `ureq`, ou um túnel — em passo futuro). Por honestidade (sem erro
-// silencioso), se alguém habilitar e cair aqui, devolvemos uma falha clara, nunca um
-// sucesso falso. Estão bloqueados de fora também: Gemini sem cota, Groq sem chave.
+// Transporte: o módulo `https` (via curl). Pré-checagem exige `habilitado` + `chave`.
+// Ficam DESABILITADOS na config por enquanto, pois dependem de chave externa (o Thiago
+// cria a do Groq grátis; a do Gemini estava sem cota). O código está pronto: basta pôr a
+// chave e `"habilitado": true`. Sem sucesso falso — qualquer erro vira FalhaProvedor.
 // --------------------------------------------------------------------------- //
 struct ProvedorOpenAiCompat {
     config: ConfigProvedor,
@@ -231,17 +231,77 @@ impl Provedor for ProvedorOpenAiCompat {
         if self.config.chave.as_deref().unwrap_or("").is_empty() {
             return Err(FalhaProvedor::Indisponivel("sem chave de API".into()));
         }
-        // Habilitado e com chave, mas ainda sem cliente HTTPS: avisa em vez de fingir.
-        Err(FalhaProvedor::Indisponivel(
-            "cliente HTTPS ainda não implementado (passo futuro) — Groq fica de fora por ora"
-                .into(),
-        ))
+        Ok(())
     }
 
-    fn responder(&self, _mensagem: &str, _contexto: &Contexto) -> Result<String, FalhaProvedor> {
-        Err(FalhaProvedor::Indisponivel(
-            "cliente HTTPS ainda não implementado".into(),
-        ))
+    fn responder(&self, mensagem: &str, contexto: &Contexto) -> Result<String, FalhaProvedor> {
+        let url_base = self
+            .config
+            .url_base
+            .as_deref()
+            .ok_or_else(|| FalhaProvedor::Indisponivel("provedor sem 'url_base'".into()))?;
+        let modelo = self
+            .config
+            .modelo
+            .as_deref()
+            .ok_or_else(|| FalhaProvedor::Indisponivel("provedor sem 'modelo'".into()))?;
+        let chave = self
+            .config
+            .chave
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| FalhaProvedor::Indisponivel("sem chave de API".into()))?;
+
+        let url = format!("{}/chat/completions", url_base.trim_end_matches('/'));
+
+        // Corpo {"model":..., "messages":[{"role":...,"content":...}, ...]} com nosso JSON.
+        let mensagens = prompt::montar_mensagens(mensagem, contexto)
+            .into_iter()
+            .map(|m| {
+                Valor::Objeto(vec![
+                    ("role".into(), Valor::Texto(m.papel)),
+                    ("content".into(), Valor::Texto(m.conteudo)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let corpo = Valor::Objeto(vec![
+            ("model".into(), Valor::Texto(modelo.to_string())),
+            ("messages".into(), Valor::Lista(mensagens)),
+        ])
+        .para_texto();
+
+        let autorizacao = format!("Bearer {chave}");
+        let resposta = https::post_json(
+            &url,
+            &corpo,
+            &[("Authorization", autorizacao.as_str())],
+            self.config.timeout,
+        )?;
+        if resposta.status != 200 {
+            return Err(FalhaProvedor::Http {
+                status: resposta.status,
+                corpo: resposta.corpo,
+            });
+        }
+
+        // Extrai choices[0].message.content.
+        let raiz = json::parsear(&resposta.corpo)
+            .map_err(|e| FalhaProvedor::RespostaInvalida(e.to_string()))?;
+        let texto = raiz
+            .obter("choices")
+            .and_then(|c| c.indice(0))
+            .and_then(|c| c.obter("message"))
+            .and_then(|m| m.obter("content"))
+            .and_then(Valor::como_texto)
+            .ok_or_else(|| {
+                FalhaProvedor::RespostaInvalida("sem choices[0].message.content".into())
+            })?
+            .trim()
+            .to_string();
+        if texto.is_empty() {
+            return Err(FalhaProvedor::RespostaVazia);
+        }
+        Ok(texto)
     }
 }
 
@@ -261,16 +321,68 @@ impl Provedor for ProvedorGeminiRest {
         if self.config.chave.as_deref().unwrap_or("").is_empty() {
             return Err(FalhaProvedor::Indisponivel("sem chave de API".into()));
         }
-        Err(FalhaProvedor::Indisponivel(
-            "cliente HTTPS ainda não implementado (passo futuro) — Gemini fica de fora por ora"
-                .into(),
-        ))
+        Ok(())
     }
 
-    fn responder(&self, _mensagem: &str, _contexto: &Contexto) -> Result<String, FalhaProvedor> {
-        Err(FalhaProvedor::Indisponivel(
-            "cliente HTTPS ainda não implementado".into(),
-        ))
+    fn responder(&self, mensagem: &str, contexto: &Contexto) -> Result<String, FalhaProvedor> {
+        let modelo = self
+            .config
+            .modelo
+            .as_deref()
+            .ok_or_else(|| FalhaProvedor::Indisponivel("gemini sem 'modelo'".into()))?;
+        let chave = self
+            .config
+            .chave
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| FalhaProvedor::Indisponivel("sem chave de API".into()))?;
+
+        // A chave do Gemini vai na query string (padrão da API generativelanguage).
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={chave}"
+        );
+
+        // Corpo {"contents":[{"parts":[{"text": prompt}]}]}.
+        let corpo = Valor::Objeto(vec![(
+            "contents".into(),
+            Valor::Lista(vec![Valor::Objeto(vec![(
+                "parts".into(),
+                Valor::Lista(vec![Valor::Objeto(vec![(
+                    "text".into(),
+                    Valor::Texto(prompt::montar_prompt(mensagem, contexto)),
+                )])]),
+            )])]),
+        )])
+        .para_texto();
+
+        let resposta = https::post_json(&url, &corpo, &[], self.config.timeout)?;
+        if resposta.status != 200 {
+            return Err(FalhaProvedor::Http {
+                status: resposta.status,
+                corpo: resposta.corpo,
+            });
+        }
+
+        // Extrai candidates[0].content.parts[0].text.
+        let raiz = json::parsear(&resposta.corpo)
+            .map_err(|e| FalhaProvedor::RespostaInvalida(e.to_string()))?;
+        let texto = raiz
+            .obter("candidates")
+            .and_then(|c| c.indice(0))
+            .and_then(|c| c.obter("content"))
+            .and_then(|c| c.obter("parts"))
+            .and_then(|p| p.indice(0))
+            .and_then(|p| p.obter("text"))
+            .and_then(Valor::como_texto)
+            .ok_or_else(|| {
+                FalhaProvedor::RespostaInvalida("sem candidates[0].content.parts[0].text".into())
+            })?
+            .trim()
+            .to_string();
+        if texto.is_empty() {
+            return Err(FalhaProvedor::RespostaVazia);
+        }
+        Ok(texto)
     }
 }
 

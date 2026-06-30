@@ -12,6 +12,7 @@
 pub mod config;
 pub mod erro;
 pub mod http;
+pub mod https;
 pub mod json;
 pub mod prompt;
 pub mod provedor;

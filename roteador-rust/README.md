@@ -16,11 +16,15 @@ escrevemos à mão, só com a stdlib:
 
 - **`json.rs`** — parser de descida recursiva + codificador de JSON.
 - **`http.rs`** — cliente HTTP/1.1 cru sobre `TcpStream` (HTTP simples, para o Ollama local).
+- **`https.rs`** — cliente HTTPS via `curl` (binário externo).
 - **`provedor.rs`** — `claude --print` via `std::process`.
 
-TLS/HTTPS **não** é reescrito à mão (inviável sem crate). Por isso os provedores remotos
-(Groq, Gemini) ficam como *slots* honestos: declarados, mas devolvem uma falha clara até
-decidirmos a abordagem de HTTPS num passo futuro — **nunca** um sucesso falso.
+TLS/HTTPS **não** é reescrito à mão (criptografia séria, inviável sem crate). Em vez disso,
+falamos HTTPS pelo `curl` — binário externo, exceção pragmática que o manifesto permite (o
+mesmo princípio do `claude --print`). Assim os provedores remotos (Groq, Gemini) são **reais**
+e mantemos **zero dependências de crates Rust**. Eles ficam desabilitados na config só porque
+dependem de chave externa (o Thiago cria a do Groq; a do Gemini estava sem cota) — basta pôr a
+chave e `"habilitado": true`. Em erro, sempre uma `FalhaProvedor` clara — **nunca** sucesso falso.
 
 ## Arquitetura
 
@@ -40,10 +44,11 @@ e citar o nome na `ordem_fallback`.
 |-----------------|-----------------------------------------------------------------|
 | `json.rs`       | JSON próprio (parse + encode), com testes                       |
 | `http.rs`       | HTTP/1.1 cru sobre TcpStream (sem TLS), com timeouts            |
+| `https.rs`      | HTTPS via `curl` (binário externo), espelha a interface do http |
 | `prompt.rs`     | Monta prompt/mensagens a partir de (mensagem, contexto)         |
 | `erro.rs`       | Erros tipados: `FalhaProvedor`, `ErroRoteador`                  |
 | `config.rs`     | Lê a config JSON dos provedores (fora do repo)                  |
-| `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, slots Groq/Gemini        |
+| `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini             |
 | `telemetria.rs` | Log de quem respondeu e por que caiu                            |
 | `lib.rs`        | `rotear()` — a cadeia de fallback                               |
 
@@ -88,10 +93,13 @@ cargo fmt --check                                        # formatação
 > O teste ao vivo usa **só** o Ollama (a ordem não inclui o Claude), de propósito: nunca
 > disparamos o Claude "só pra testar" (evita risco no refresh do token OAuth).
 
-## Estado (passo 1 do plano Rust — concluído)
+## Estado (passo 1 do plano Rust — concluído, + refino de provedores)
 
 - [x] Trait `Provedor` + cadeia de fallback
 - [x] `ProvedorOllama` (HTTP cru) — **provado ao vivo**: respondeu "Paris."
 - [x] `ProvedorClaudeCli` (`claude --print`, sem tocar no refresh)
-- [x] Slots Groq/Gemini (honestos, bloqueados em HTTPS/chave)
-- [ ] Próximo: ponte-telegram em Rust + HTTPS para Groq/Gemini
+- [x] `ProvedorOpenAiCompat` (Groq) e `ProvedorGeminiRest` via HTTPS (curl) — código
+      completo; transporte **provado ao vivo** (HTTP 400 estruturado do Gemini com chave
+      inválida). Faltam só as chaves para habilitar.
+- [ ] Próximo: ponte-telegram em Rust (webhook + secret + allowFrom), reusando `https`
+      para responder ao Telegram

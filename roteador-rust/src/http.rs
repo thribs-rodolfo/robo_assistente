@@ -23,6 +23,7 @@ struct UrlPartes {
 }
 
 /// Resposta HTTP crua: o status numérico e o corpo (texto).
+#[derive(Debug, Clone, PartialEq)]
 pub struct RespostaHttp {
     pub status: u16,
     pub corpo: String,
