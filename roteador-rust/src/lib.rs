@@ -88,10 +88,14 @@ pub fn rotear(
             continue;
         }
 
-        // Tentativa real.
-        match provedor.responder(mensagem, contexto) {
+        // Tentativa real. Medimos a latência para a telemetria (custo/performance):
+        // saber QUANTO cada provedor demora é tão útil quanto saber QUEM respondeu.
+        let inicio = std::time::Instant::now();
+        let resultado = provedor.responder(mensagem, contexto);
+        let ms = inicio.elapsed().as_millis();
+        match resultado {
             Ok(texto) => {
-                telemetria::registrar(&format!("[ok] respondido por '{nome}'"));
+                telemetria::registrar(&format!("[ok] respondido por '{nome}' em {ms}ms"));
                 return Ok(RespostaRoteada {
                     texto,
                     provedor: nome.clone(),
@@ -99,7 +103,9 @@ pub fn rotear(
             }
             Err(falha) => {
                 let motivo = format!("{nome}: {falha}");
-                telemetria::registrar(&format!("[falha] {motivo} — caindo pro próximo"));
+                telemetria::registrar(&format!(
+                    "[falha] {motivo} (após {ms}ms) — caindo pro próximo"
+                ));
                 motivos.push(motivo);
             }
         }
