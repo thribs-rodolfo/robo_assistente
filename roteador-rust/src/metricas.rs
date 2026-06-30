@@ -83,6 +83,56 @@ impl Relatorio {
         }
     }
 
+    /// Custo estimado por provedor no período, dado uma `tabela` de preços
+    /// (provedor -> custo por resposta bem-sucedida, na unidade que o operador escolher:
+    /// centavos, dólares, créditos...). Para cada provedor do relatório, multiplica os
+    /// `sucessos` pelo custo unitário; quem não está na `tabela` entra com custo 0
+    /// (ex.: o piso Ollama, local e grátis). Devolve sempre todos os provedores do
+    /// relatório, para a conta ficar transparente (inclusive os de custo zero).
+    ///
+    /// Limitação honesta (código educacional): o log só guarda QUEM respondeu e QUANTO
+    /// demorou — não o tamanho da resposta em tokens. Então o custo aqui é POR RESPOSTA,
+    /// não por token. É uma aproximação de dependência-em-dinheiro, não a fatura exata.
+    pub fn custo_por_provedor(&self, tabela: &BTreeMap<String, f64>) -> BTreeMap<String, f64> {
+        self.por_provedor
+            .iter()
+            .map(|(nome, m)| {
+                let unitario = tabela.get(nome).copied().unwrap_or(0.0);
+                (nome.clone(), m.sucessos as f64 * unitario)
+            })
+            .collect()
+    }
+
+    /// Custo estimado total no período = soma do custo de todos os provedores.
+    pub fn custo_total(&self, tabela: &BTreeMap<String, f64>) -> f64 {
+        self.custo_por_provedor(tabela).values().sum()
+    }
+
+    /// Bloco de texto com o custo estimado por provedor e o total, ou `None` quando a
+    /// `tabela` de preços está vazia (sem `--custo` na linha de comando, não imprime nada).
+    /// Fica separado do [`Display`](std::fmt::Display) porque depende de um parâmetro externo
+    /// (a tabela), e `Display` não recebe parâmetros.
+    pub fn secao_custo(&self, tabela: &BTreeMap<String, f64>) -> Option<String> {
+        if tabela.is_empty() {
+            return None;
+        }
+        let mut texto = String::from("-- custo estimado (por resposta) --\n");
+        for (nome, custo) in self.custo_por_provedor(tabela) {
+            // Marca de onde veio o preço: da tabela, ou assumido 0 (provedor sem preço).
+            let origem = if tabela.contains_key(&nome) {
+                ""
+            } else {
+                " (sem preço → 0)"
+            };
+            texto.push_str(&format!("- {nome}: {custo:.2}{origem}\n"));
+        }
+        texto.push_str(&format!(
+            "custo total estimado: {:.2}\n",
+            self.custo_total(tabela)
+        ));
+        Some(texto)
+    }
+
     /// Atualiza as sequências de "caiu no piso" a cada `[ok]`, na ordem cronológica do log.
     /// Cada resposta de provedor bom zera a sequência atual; cada Ollama soma +1.
     fn registrar_sequencia(&mut self, nome: &str) {
@@ -464,6 +514,45 @@ linha de ruído sem formato
         let texto = format!("{}", agregar(log));
         assert!(texto.contains("total de roteamentos: 2"));
         assert!(texto.contains("caiu no piso (Ollama): 1 de 2 (50.0%)"));
+    }
+
+    #[test]
+    fn custo_estimado_por_provedor_e_total() {
+        // claude respondeu 2x, ollama 1x. Preço: claude 3.0/resposta, ollama fora da tabela (0).
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'claude' em 600ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let r = agregar(log);
+        let mut tabela = BTreeMap::new();
+        tabela.insert("claude".to_string(), 3.0);
+
+        let por_provedor = r.custo_por_provedor(&tabela);
+        assert_eq!(por_provedor["claude"], 6.0); // 2 respostas * 3.0
+        assert_eq!(por_provedor["ollama_local"], 0.0); // sem preço = grátis (piso local)
+        assert_eq!(r.custo_total(&tabela), 6.0);
+    }
+
+    #[test]
+    fn secao_custo_so_aparece_com_tabela() {
+        let log = "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms\n";
+        let r = agregar(log);
+
+        // Sem tabela: nada a mostrar.
+        assert!(r.secao_custo(&BTreeMap::new()).is_none());
+
+        // Com tabela: bloco com o provedor, seu custo e o total.
+        let mut tabela = BTreeMap::new();
+        tabela.insert("claude".to_string(), 2.5);
+        let texto = r.secao_custo(&tabela).unwrap();
+        assert!(texto.contains("- claude: 2.50"));
+        assert!(texto.contains("custo total estimado: 2.50"));
+        // Provedor sem preço aparece marcado como assumido 0 (transparência da conta).
+        let log2 =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
+        let texto2 = agregar(log2).secao_custo(&tabela).unwrap();
+        assert!(texto2.contains("ollama_local: 0.00 (sem preço → 0)"));
     }
 
     #[test]

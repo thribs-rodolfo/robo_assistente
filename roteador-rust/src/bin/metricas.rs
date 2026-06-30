@@ -5,6 +5,7 @@
 //!   metricas /caminho/outro.log    # lê outro arquivo de log
 //!   metricas --janela 24h          # só as últimas 24 horas (aceita 90m, 24h, 7d)
 //!   metricas --janela 6h /tmp/x.log
+//!   metricas --custo claude=3 --custo gemini=0.5   # estima custo por provedor
 //!
 //! Responde, de forma legível, "de quem o robô realmente depende?": por provedor,
 //! quantas vezes respondeu/falhou/foi pulado e a latência média; quantas vezes caímos
@@ -13,6 +14,7 @@
 //!
 //! Saída de processo: 0 em sucesso, 1 se não conseguir ler o log ou se o argumento for inválido.
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,6 +56,10 @@ fn main() -> ExitCode {
                 println!("(janela: últimas {})", descrever_duracao(janela));
             }
             print!("{relatorio}");
+            // Só imprime o custo se o operador passou pelo menos um `--custo`.
+            if let Some(secao) = relatorio.secao_custo(&opcoes.precos) {
+                print!("{secao}");
+            }
             ExitCode::SUCCESS
         }
         Err(erro) => {
@@ -69,6 +75,9 @@ struct Opcoes {
     caminho: String,
     /// Janela em segundos, ou `None` para agregar tudo.
     janela_segundos: Option<u64>,
+    /// Tabela de preços (provedor -> custo por resposta) vinda dos `--custo nome=valor`.
+    /// Vazia quando não foi passado nenhum: aí o relatório não mostra custo.
+    precos: BTreeMap<String, f64>,
 }
 
 /// Interpreta os argumentos: `--janela <dur>` (em qualquer posição) e, opcionalmente, um caminho.
@@ -76,6 +85,7 @@ struct Opcoes {
 fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
     let mut caminho: Option<String> = None;
     let mut janela_segundos: Option<u64> = None;
+    let mut precos: BTreeMap<String, f64> = BTreeMap::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -88,6 +98,17 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
             i += 2;
         } else if let Some(valor) = arg.strip_prefix("--janela=") {
             janela_segundos = Some(parsear_duracao(valor)?);
+            i += 1;
+        } else if arg == "--custo" {
+            let valor = args
+                .get(i + 1)
+                .ok_or_else(|| format!("{arg} precisa de um valor (ex.: claude=3)"))?;
+            let (nome, preco) = parsear_preco(valor)?;
+            precos.insert(nome, preco);
+            i += 2;
+        } else if let Some(valor) = arg.strip_prefix("--custo=") {
+            let (nome, preco) = parsear_preco(valor)?;
+            precos.insert(nome, preco);
             i += 1;
         } else if arg.starts_with('-') {
             return Err(format!("opção desconhecida: {arg}"));
@@ -102,7 +123,31 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
     Ok(Opcoes {
         caminho: caminho.unwrap_or_else(|| telemetria::ARQUIVO_LOG.to_string()),
         janela_segundos,
+        precos,
     })
+}
+
+/// Interpreta um `nome=valor` de `--custo` (ex.: `claude=3.5`) em (nome, preço).
+/// O preço é o custo por resposta bem-sucedida, na unidade que o operador escolher.
+/// Devolve `Err(mensagem)` em formato inválido — sem `panic`, sem erro silencioso.
+fn parsear_preco(texto: &str) -> Result<(String, f64), String> {
+    let (nome, valor) = texto
+        .split_once('=')
+        .ok_or_else(|| format!("--custo espera nome=valor (ex.: claude=3), veio: '{texto}'"))?;
+    let nome = nome.trim();
+    if nome.is_empty() {
+        return Err(format!("--custo sem nome de provedor: '{texto}'"));
+    }
+    let preco: f64 = valor
+        .trim()
+        .parse()
+        .map_err(|_| format!("--custo com preço inválido: '{valor}' (use um número, ex.: 3.5)"))?;
+    if !preco.is_finite() || preco < 0.0 {
+        return Err(format!(
+            "--custo com preço inválido: '{valor}' (precisa ser >= 0)"
+        ));
+    }
+    Ok((nome.to_string(), preco))
 }
 
 /// Instante atual em epoch (segundos UTC), ou `None` se o relógio estiver antes de 1970.
@@ -134,6 +179,7 @@ mod testes {
         let o = interpretar_argumentos(&[]).unwrap();
         assert_eq!(o.caminho, telemetria::ARQUIVO_LOG);
         assert_eq!(o.janela_segundos, None);
+        assert!(o.precos.is_empty());
     }
 
     #[test]
@@ -141,5 +187,33 @@ mod testes {
         assert!(interpretar_argumentos(&["--janela".into()]).is_err()); // sem valor
         assert!(interpretar_argumentos(&["--xpto".into()]).is_err()); // opção desconhecida
         assert!(interpretar_argumentos(&["a".into(), "b".into()]).is_err()); // dois caminhos
+    }
+
+    #[test]
+    fn coleta_varios_precos_de_custo() {
+        let o = interpretar_argumentos(&[
+            "--custo".into(),
+            "claude=3".into(),
+            "--custo=gemini=0.5".into(),
+        ])
+        .unwrap();
+        assert_eq!(o.precos.get("claude"), Some(&3.0));
+        assert_eq!(o.precos.get("gemini"), Some(&0.5));
+    }
+
+    #[test]
+    fn parsear_preco_valida_formato_e_sinal() {
+        assert_eq!(
+            parsear_preco("claude=3.5").unwrap(),
+            ("claude".to_string(), 3.5)
+        );
+        assert_eq!(
+            parsear_preco(" groq = 0 ").unwrap(),
+            ("groq".to_string(), 0.0)
+        );
+        assert!(parsear_preco("semigual").is_err()); // falta '='
+        assert!(parsear_preco("=3").is_err()); // sem nome
+        assert!(parsear_preco("x=abc").is_err()); // preço não-numérico
+        assert!(parsear_preco("x=-1").is_err()); // preço negativo
     }
 }

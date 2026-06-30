@@ -108,6 +108,27 @@ realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar �
 A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
 mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
 
+### Custo estimado (`--custo`)
+
+A dependência também tem **preço**. Passe `--custo <provedor>=<valor>` (repetível) com o
+custo por resposta de cada provedor pago — na unidade que você quiser (centavos, dólares,
+créditos) — e o relatório fecha com o custo estimado no período:
+
+```sh
+./target/release/metricas --janela 24h --custo claude=3 --custo gemini=0.5
+# ... (relatório normal acima) ...
+# -- custo estimado (por resposta) --
+# - claude: 3.00
+# - ollama_local: 0.00 (sem preço → 0)
+# custo total estimado: 3.00
+```
+
+Quem não tem preço entra como **0** (ex.: o piso Ollama, local e grátis), marcado para a
+conta ficar transparente. Sem nenhum `--custo`, a seção nem aparece (compatível com o uso
+antigo). **Limitação honesta:** o log guarda QUEM respondeu, não o tamanho da resposta em
+tokens — então o custo é **por resposta**, uma aproximação de dependência-em-dinheiro, não
+a fatura exata.
+
 > Nota: linhas no formato ANTIGO do roteador Python (`... ,177 INFO [roteador]
 > respondido por '...'`) são **ignoradas de propósito** (schema diferente) e contadas
 > em "linhas ignoradas" — sem truncar em silêncio. A telemetria nova é toda em Rust.
