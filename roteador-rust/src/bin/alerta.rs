@@ -91,15 +91,23 @@ fn main() -> ExitCode {
 fn rodar_alarme_sequencia(opcoes: &Opcoes, relatorio: &metricas::Relatorio) -> Result<(), String> {
     let ja_alertado = ler_estado_tolerante(&opcoes.caminho_estado)?;
     let sequencia = relatorio.sequencia_atual_no_piso;
-    let decisao = alerta::decidir(sequencia, opcoes.limite, ja_alertado);
     let severidade = alerta::severidade(sequencia, opcoes.limite);
+    // Decide pelo anti-spam por degraus e, em CRÍTICO, fura o anti-spam (re-avisa a cada rodada).
+    let decisao_base = alerta::decidir(sequencia, opcoes.limite, ja_alertado);
+    let decisao = alerta::escalonar_por_severidade(decisao_base.clone(), severidade, sequencia);
+    let furou_anti_spam = decisao.notificar && !decisao_base.notificar;
     println!(
         "[alerta] seq_no_piso={sequencia} limite={} ja_alertado={ja_alertado} \
-         severidade={} -> notificar={} novo_estado={}",
+         severidade={} -> notificar={} novo_estado={}{}",
         opcoes.limite,
         severidade.etiqueta(),
         decisao.notificar,
-        decisao.novo_estado
+        decisao.novo_estado,
+        if furou_anti_spam {
+            " (CRÍTICO: furou o anti-spam)"
+        } else {
+            ""
+        }
     );
 
     if opcoes.simular {
@@ -132,13 +140,6 @@ fn rodar_alarme_percentual(opcoes: &Opcoes, relatorio: &metricas::Relatorio) -> 
     let ja_em_alta = ler_estado_tolerante(&opcoes.caminho_estado_percentual)? != 0;
     let piso = relatorio.sucessos_no_piso();
     let total = relatorio.total_roteamentos();
-    let decisao = alerta::decidir_por_percentual(
-        piso,
-        total,
-        opcoes.limiar_percentual,
-        opcoes.minimo_amostras,
-        ja_em_alta,
-    );
     // Percentual inteiro (mesma conta da decisão) para classificar a severidade.
     let pct_inteiro = if total == 0 {
         0
@@ -146,15 +147,30 @@ fn rodar_alarme_percentual(opcoes: &Opcoes, relatorio: &metricas::Relatorio) -> 
         (piso as u128 * 100 / total as u128) as u64
     };
     let severidade = alerta::severidade_percentual(pct_inteiro, opcoes.limiar_percentual);
+    // Decide pela histerese e, em CRÍTICO, fura a histerese (re-avisa a cada rodada).
+    let decisao_base = alerta::decidir_por_percentual(
+        piso,
+        total,
+        opcoes.limiar_percentual,
+        opcoes.minimo_amostras,
+        ja_em_alta,
+    );
+    let decisao = alerta::escalonar_percentual_por_severidade(decisao_base.clone(), severidade);
+    let furou_anti_spam = decisao.notificar && !decisao_base.notificar;
     println!(
         "[alerta] pct_no_piso={:.0}% ({piso}/{total}) limiar={}% min_amostras={} \
-         ja_em_alta={ja_em_alta} severidade={} -> notificar={} novo_estado={}",
+         ja_em_alta={ja_em_alta} severidade={} -> notificar={} novo_estado={}{}",
         relatorio.percentual_no_piso(),
         opcoes.limiar_percentual,
         opcoes.minimo_amostras,
         severidade.etiqueta(),
         decisao.notificar,
-        decisao.ja_em_alta
+        decisao.ja_em_alta,
+        if furou_anti_spam {
+            " (CRÍTICO: furou a histerese)"
+        } else {
+            ""
+        }
     );
 
     // Descrição legível da janela para a mensagem (ex.: "24h"); sem janela => "todo o histórico".

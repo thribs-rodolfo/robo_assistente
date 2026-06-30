@@ -141,6 +141,16 @@ São **dois alarmes ortogonais** sobre o mesmo log, cada um com seu anti-spam:
    🟠 **ALERTA** (80–89%) → 🔴 **CRÍTICO** (≥ 90%). Mesma escada visual do alarme de sequência,
    então as duas mensagens "falam a mesma língua" de gravidade.
 
+**Escalada de urgência em CRÍTICO** (`alerta::escalonar_por_severidade` /
+`escalonar_percentual_por_severidade`): no nível 🔴 **CRÍTICO** os dois alarmes mudam de
+comportamento, porque um silêncio longo numa situação grave é pior que uma repetição. (1) A
+mensagem abre com o banner **🚨 URGENTE 🚨** (`alerta::prefixo_urgencia`) — o sinal mais forte
+que o canal de texto permite, já que o `notificar-thiago.sh` não tem prioridade nativa. (2) O
+anti-spam é **furado**: em vez de esperar o próximo degrau (sequência) ou ficar preso na histerese
+(percentual), o alarme **re-avisa a cada rodada do cron** enquanto seguir crítico, mantendo o
+estado coerente para o anti-spam normal voltar a valer assim que de-escalar. Abaixo de CRÍTICO
+nada muda — ATENÇÃO/ALERTA seguem o anti-spam por degraus/histerese, sem flood.
+
 Ambos só LÊEM o log — nunca disparam provedor → não tocam o Claude.
 
 ```sh

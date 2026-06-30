@@ -135,6 +135,63 @@ pub fn severidade_percentual(percentual_no_piso: u64, limiar: u8) -> Severidade 
     nivel_para_severidade(passos_acima + 1)
 }
 
+/// Prefixo de URGÊNCIA que abre a mensagem quando a severidade é CRÍTICA. Como o canal de
+/// notificação (Telegram via `notificar-thiago.sh`) é o mesmo para todos os níveis e não aceita
+/// "prioridade" nativa, a escalada de urgência por nível se materializa no TEXTO: um banner bem
+/// visível que separa um aviso crítico (dependência prolongada do piso fraco) de um aviso leve.
+/// Abaixo de CRÍTICO o prefixo é vazio (a etiqueta colorida já basta — sem poluir avisos leves).
+pub fn prefixo_urgencia(severidade: Severidade) -> &'static str {
+    match severidade {
+        Severidade::Critico => "🚨 URGENTE 🚨 ",
+        _ => "",
+    }
+}
+
+/// Escala a decisão do alarme de SEQUÊNCIA por severidade: em nível CRÍTICO, FURA o anti-spam.
+///
+/// O anti-spam normal de [`decidir`] só re-avisa ao acumular mais um degrau inteiro de `limite`
+/// quedas. Em CRÍTICO (sequência `>= 3*limite` — dependência prolongada do piso), esperar um
+/// degrau inteiro pode deixar o Thiago sem aviso por muito tempo enquanto o robô segue degradado;
+/// nesse nível, um silêncio longo é pior que uma repetição. Então re-avisamos a CADA rodada do
+/// cron, mantendo o estado coerente (a maior sequência já vista) para quando de-escalar e o
+/// anti-spam por degraus voltar a valer. Abaixo de CRÍTICO devolve a decisão original (sem flood
+/// nos níveis leves — ATENÇÃO/ALERTA seguem o anti-spam por degraus).
+pub fn escalonar_por_severidade(
+    decisao: Decisao,
+    severidade: Severidade,
+    sequencia_atual: u64,
+) -> Decisao {
+    if severidade == Severidade::Critico {
+        Decisao {
+            notificar: true,
+            // Mantém o maior valor já coberto: se de-escalar, o degrau seguinte mede daqui.
+            novo_estado: sequencia_atual.max(decisao.novo_estado),
+        }
+    } else {
+        decisao
+    }
+}
+
+/// Escala a decisão do alarme PERCENTUAL por severidade: em nível CRÍTICO, FURA a histerese.
+///
+/// Espelha [`escalonar_por_severidade`] para o alarme percentual. Em CRÍTICO (fração no piso
+/// `>= limiar + 2*passo`, ex.: `>= 90%` com limiar 70) re-avisamos a cada rodada em vez de ficar
+/// calado pela histerese — quase tudo caindo no piso é grave o bastante para insistir. Mantém o
+/// estado "em alta" para a de-escalada (quando a fração cair com folga) re-armar normalmente.
+pub fn escalonar_percentual_por_severidade(
+    decisao: DecisaoPercentual,
+    severidade: Severidade,
+) -> DecisaoPercentual {
+    if severidade == Severidade::Critico {
+        DecisaoPercentual {
+            notificar: true,
+            ja_em_alta: true,
+        }
+    } else {
+        decisao
+    }
+}
+
 /// Margem de histerese (em pontos percentuais) do alarme percentual. Depois de alertar que
 /// a fração no piso passou do limiar, só consideramos "recuperado" quando ela cair a
 /// `limiar - MARGEM` ou menos. Sem essa folga, um percentual oscilando bem na fronteira do
@@ -210,9 +267,11 @@ pub fn mensagem_alerta(relatorio: &Relatorio, limite: u64) -> String {
     let seq = relatorio.sequencia_atual_no_piso;
     let piso = relatorio.sucessos_no_piso();
     let total = relatorio.total_roteamentos();
-    let etiqueta = severidade(seq, limite).etiqueta();
+    let severidade = severidade(seq, limite);
+    let etiqueta = severidade.etiqueta();
+    let urgencia = prefixo_urgencia(severidade);
     format!(
-        "{etiqueta} Roteador: caí no piso (Ollama) {seq}x SEGUIDAS (limite de alerta: {limite}).\n\
+        "{urgencia}{etiqueta} Roteador: caí no piso (Ollama) {seq}x SEGUIDAS (limite de alerta: {limite}).\n\
          A cadeia de provedores bons (Claude/Groq/Gemini) está falhando em série — o robô \
          está respondendo só pelo modelo local fraco.\n\
          Verifique: token do Claude (refresh) e chaves Groq/Gemini.\n\
@@ -237,13 +296,15 @@ pub fn mensagem_alerta_percentual(
     } else {
         (piso as u128 * 100 / total as u128) as u64
     };
-    let etiqueta = severidade_percentual(pct_inteiro, limiar_percentual).etiqueta();
+    let severidade = severidade_percentual(pct_inteiro, limiar_percentual);
+    let etiqueta = severidade.etiqueta();
+    let urgencia = prefixo_urgencia(severidade);
     let periodo = match janela {
         Some(j) => format!("nas últimas {j}"),
         None => "em todo o histórico".to_string(),
     };
     format!(
-        "{etiqueta} Roteador: {pct:.0}% dos roteamentos {periodo} caíram no piso (Ollama) — \
+        "{urgencia}{etiqueta} Roteador: {pct:.0}% dos roteamentos {periodo} caíram no piso (Ollama) — \
          {piso} de {total} (limiar de alerta: {limiar_percentual}%).\n\
          Mesmo sem quedas longas em série, a dependência do modelo local fraco está alta: \
          a cadeia de provedores bons (Claude/Groq/Gemini) está respondendo pouco.\n\
@@ -553,5 +614,102 @@ mod testes {
         assert_eq!(Severidade::Atencao.etiqueta(), "🟡 ATENÇÃO");
         assert_eq!(Severidade::Alerta.etiqueta(), "🟠 ALERTA");
         assert_eq!(Severidade::Critico.etiqueta(), "🔴 CRÍTICO");
+    }
+
+    #[test]
+    fn prefixo_urgencia_so_no_critico() {
+        // Só CRÍTICO ganha o banner de urgência; níveis leves não poluem a mensagem.
+        assert_eq!(prefixo_urgencia(Severidade::Normal), "");
+        assert_eq!(prefixo_urgencia(Severidade::Atencao), "");
+        assert_eq!(prefixo_urgencia(Severidade::Alerta), "");
+        assert_eq!(prefixo_urgencia(Severidade::Critico), "🚨 URGENTE 🚨 ");
+    }
+
+    #[test]
+    fn escalonamento_de_sequencia_fura_anti_spam_so_no_critico() {
+        // Em CRÍTICO, mesmo que `decidir` mandasse calar (não completou novo degrau), forçamos
+        // o aviso e mantemos o estado coerente (maior sequência vista).
+        let calar = Decisao {
+            notificar: false,
+            novo_estado: 9,
+        };
+        let escalada = escalonar_por_severidade(calar, Severidade::Critico, 10);
+        assert_eq!(
+            escalada,
+            Decisao {
+                notificar: true,
+                novo_estado: 10
+            }
+        );
+        // Abaixo de CRÍTICO a decisão original passa intacta (sem flood nos níveis leves).
+        let calar2 = Decisao {
+            notificar: false,
+            novo_estado: 3,
+        };
+        assert_eq!(
+            escalonar_por_severidade(calar2.clone(), Severidade::Alerta, 4),
+            calar2
+        );
+    }
+
+    #[test]
+    fn escalonamento_de_sequencia_preserva_maior_estado() {
+        // Se a decisão já cobria um valor maior que a sequência atual (caso de borda), o estado
+        // não regride — mantém o maior já coberto.
+        let decisao = Decisao {
+            notificar: true,
+            novo_estado: 12,
+        };
+        let escalada = escalonar_por_severidade(decisao, Severidade::Critico, 9);
+        assert_eq!(escalada.novo_estado, 12);
+        assert!(escalada.notificar);
+    }
+
+    #[test]
+    fn escalonamento_percentual_fura_histerese_so_no_critico() {
+        // Em CRÍTICO (>= 90% no piso), furamos a histerese e re-avisamos mantendo "em alta".
+        let calar = DecisaoPercentual {
+            notificar: false,
+            ja_em_alta: true,
+        };
+        assert_eq!(
+            escalonar_percentual_por_severidade(calar, Severidade::Critico),
+            DecisaoPercentual {
+                notificar: true,
+                ja_em_alta: true
+            }
+        );
+        // Abaixo de CRÍTICO a decisão original passa intacta.
+        let calar2 = DecisaoPercentual {
+            notificar: false,
+            ja_em_alta: true,
+        };
+        assert_eq!(
+            escalonar_percentual_por_severidade(calar2.clone(), Severidade::Alerta),
+            calar2
+        );
+    }
+
+    #[test]
+    fn mensagem_critica_abre_com_banner_de_urgencia() {
+        // 9 quedas seguidas, limite 3 -> CRÍTICO (>= 3*limite) -> banner de urgência na frente.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:01 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:02 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:03 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:04 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:05 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:06 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:07 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:00:08 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let relatorio = crate::metricas::agregar(log);
+        let msg = mensagem_alerta(&relatorio, 3);
+        assert!(msg.starts_with("🚨 URGENTE 🚨 🔴 CRÍTICO"));
+        // Um nível leve (limite alto) NÃO leva banner.
+        let msg_leve = mensagem_alerta(&relatorio, 9); // 9 quedas, limite 9 -> ATENÇÃO
+        assert!(msg_leve.starts_with("🟡 ATENÇÃO"));
+        assert!(!msg_leve.contains("URGENTE"));
     }
 }
