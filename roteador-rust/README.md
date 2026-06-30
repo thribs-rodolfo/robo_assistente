@@ -119,28 +119,43 @@ LÊ o log (nunca dispara provedor → não toca o Claude) e, quando o robô cai 
 **N vezes SEGUIDAS** — a cadeia de provedores bons falhando em série —, manda uma mensagem
 pro Thiago via `/root/notificar-thiago.sh`.
 
-A regra de "quando avisar / quando calar" é a função pura `alerta::decidir`, então é testada
-sem disco nem Telegram. **Anti-spam por arquivo de estado**: avisa **uma vez por rajada** e de
-novo só quando piora um degrau inteiro (mais `limite` quedas). Quando um provedor bom volta a
-responder, a sequência zera e o estado é limpo — a próxima rajada volta a alertar do zero.
+São **dois alarmes ortogonais** sobre o mesmo log, cada um com seu anti-spam:
+
+1. **Sequência** — quedas no piso **SEGUIDAS** (cadeia de cima falhando em série AGORA).
+   Função pura `alerta::decidir`. Anti-spam por arquivo de estado: avisa **uma vez por
+   rajada** e de novo só quando piora um degrau inteiro (mais `limite` quedas). Quando um
+   provedor bom responde, a sequência zera e o estado é limpo.
+2. **Percentual** — **fração alta** de quedas no piso na janela, *mesmo sem quedas em série*
+   (cadeia falhando de forma intermitente mas pesada — ex.: 8 de 10 roteamentos no piso, sem
+   nunca acumular 5 seguidas). Função pura `alerta::decidir_por_percentual`. Pega o que o alarme
+   de sequência deixa passar. Anti-spam com **histerese**: avisa ao cruzar o limiar, fica quieto
+   enquanto continua alto e só re-arma quando a fração cai com folga (`limiar − 15` pontos),
+   evitando ligar/desligar na fronteira. Exige um **mínimo de amostras** para não alertar com
+   pouca evidência (ex.: "1 de 1 = 100%").
+
+Ambos só LÊEM o log — nunca disparam provedor → não tocam o Claude.
 
 ```sh
 ./target/release/alerta --simular              # decide e imprime, NÃO manda Telegram nem grava estado
-./target/release/alerta --limite 5 --janela 24h
+./target/release/alerta --limite 5 --limiar-percentual 70 --janela 24h
 # [alerta] seq_no_piso=3 limite=5 ja_alertado=0 -> notificar=false novo_estado=0
+# [alerta] pct_no_piso=100% (3/3) limiar=70% min_amostras=8 ja_em_alta=false -> notificar=false novo_estado=false
 ```
 
-| Opção            | Default                                   | O que faz                          |
-|------------------|-------------------------------------------|------------------------------------|
-| `--limite N`     | 5                                         | quedas seguidas no piso para alertar |
-| `--janela <dur>` | (tudo)                                    | só considera as últimas `<dur>` (24h, 90m…) |
-| `--estado <p>`   | `/var/log/roteador-alerta-piso.estado`    | arquivo de estado anti-spam        |
-| `--notificador <p>` | `/root/notificar-thiago.sh`            | script que manda a mensagem        |
-| `--simular`      | —                                         | dry-run: não notifica nem grava    |
+| Opção                  | Default                                       | O que faz                                  |
+|------------------------|-----------------------------------------------|--------------------------------------------|
+| `--limite N`           | 5                                             | quedas **seguidas** no piso para alertar   |
+| `--limiar-percentual N`| 70                                            | **%** no piso na janela para alertar       |
+| `--minimo-amostras N`  | 8                                             | roteamentos mínimos p/ o alarme % valer    |
+| `--janela <dur>`       | (tudo)                                        | só considera as últimas `<dur>` (24h, 90m…) |
+| `--estado <p>`         | `/var/log/roteador-alerta-piso.estado`        | estado anti-spam do alarme de sequência    |
+| `--estado-percentual <p>` | `/var/log/roteador-alerta-percentual.estado` | estado anti-spam do alarme percentual    |
+| `--notificador <p>`    | `/root/notificar-thiago.sh`                   | script que manda a mensagem                |
+| `--simular`            | —                                             | dry-run: não notifica nem grava            |
 
-No cron (`/root/alerta-piso-roteador.sh`, a cada 30min): `alerta --limite 5 --janela 24h`.
-O limite default é conservador de propósito: só incomoda o Thiago quando a degradação é clara
-e em série.
+No cron (`/root/alerta-piso-roteador.sh`, a cada 30min): `alerta --limite 5 --janela 24h`
+(os defaults de percentual entram automaticamente). Os limites são conservadores de propósito:
+só incomodam o Thiago quando a degradação é clara — em série **ou** em fração alta.
 
 ## Ponte Telegram (`bin/ponte-telegram`)
 

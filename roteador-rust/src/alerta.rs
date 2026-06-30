@@ -64,6 +64,76 @@ pub fn decidir(sequencia_atual: u64, limite: u64, ja_alertado: u64) -> Decisao {
     }
 }
 
+/// Margem de histerese (em pontos percentuais) do alarme percentual. Depois de alertar que
+/// a fração no piso passou do limiar, só consideramos "recuperado" quando ela cair a
+/// `limiar - MARGEM` ou menos. Sem essa folga, um percentual oscilando bem na fronteira do
+/// limiar ligaria/desligaria o alarme a cada rodada do cron (flapping) e floodaria o Thiago.
+pub const MARGEM_HISTERESE_PERCENTUAL: u8 = 15;
+
+/// O que o alarme PERCENTUAL deve fazer. Espelha [`Decisao`], mas o estado anti-spam aqui é
+/// um liga/desliga ("estou numa fase de alta já avisada?") em vez de um contador de degraus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisaoPercentual {
+    /// Se `true`, dispare a notificação ao Thiago.
+    pub notificar: bool,
+    /// Novo estado a gravar: `true` = "estou numa fase de alta já alertada" (não realertar).
+    pub ja_em_alta: bool,
+}
+
+/// Decide se deve alertar pela FRAÇÃO de quedas no piso numa janela — ortogonal ao alarme de
+/// sequência ([`decidir`]). Pega o caso em que a cadeia de cima falha de forma intermitente
+/// mas pesada (ex.: 8 de 10 roteamentos no piso) sem nunca acumular quedas seguidas suficientes.
+///
+/// - `piso`/`total`: quedas no piso e total de roteamentos no período (de [`Relatorio`]).
+/// - `limiar_percentual`: a partir de que % no piso alertar (ex.: 70).
+/// - `minimo_amostras`: abaixo de tantos roteamentos não há sinal confiável (evita "1 de 1 = 100%").
+/// - `ja_em_alta`: estado anterior (lido do arquivo) — já avisamos nesta fase de alta?
+///
+/// Regra (com histerese [`MARGEM_HISTERESE_PERCENTUAL`] para não ficar piscando):
+/// - Amostras de menos: não alerta e re-arma (zera o estado) — não dá pra concluir.
+/// - `% >= limiar`: alerta só na primeira vez; depois fica armado e quieto.
+/// - `% <= limiar - margem`: voltou ao normal com folga → re-arma para a próxima fase.
+/// - Zona morta entre os dois: mantém o estado (nem alerta de novo, nem re-arma).
+pub fn decidir_por_percentual(
+    piso: u64,
+    total: u64,
+    limiar_percentual: u8,
+    minimo_amostras: u64,
+    ja_em_alta: bool,
+) -> DecisaoPercentual {
+    // Sem amostras suficientes não há sinal confiável: não alerta e re-arma para a próxima fase.
+    if total < minimo_amostras.max(1) {
+        return DecisaoPercentual {
+            notificar: false,
+            ja_em_alta: false,
+        };
+    }
+    // Percentual em inteiro (comparação estável, sem float colado na fronteira do limiar).
+    let pct = (piso as u128 * 100 / total as u128) as u64;
+    let limiar = limiar_percentual as u64;
+    let recuperacao = limiar_percentual.saturating_sub(MARGEM_HISTERESE_PERCENTUAL) as u64;
+
+    if pct >= limiar {
+        // Em alta: alerta na primeira vez; nas próximas rodadas fica armado e calado.
+        DecisaoPercentual {
+            notificar: !ja_em_alta,
+            ja_em_alta: true,
+        }
+    } else if pct <= recuperacao {
+        // Caiu bem abaixo do limiar: fase de alta acabou, re-arma para a próxima.
+        DecisaoPercentual {
+            notificar: false,
+            ja_em_alta: false,
+        }
+    } else {
+        // Zona morta (entre recuperação e limiar): segura o estado atual para não flapar.
+        DecisaoPercentual {
+            notificar: false,
+            ja_em_alta,
+        }
+    }
+}
+
 /// Monta a mensagem de alerta enviada ao Thiago. Concisa e acionável.
 pub fn mensagem_alerta(relatorio: &Relatorio, limite: u64) -> String {
     let seq = relatorio.sequencia_atual_no_piso;
@@ -75,6 +145,29 @@ pub fn mensagem_alerta(relatorio: &Relatorio, limite: u64) -> String {
          está respondendo só pelo modelo local fraco.\n\
          Verifique: token do Claude (refresh) e chaves Groq/Gemini.\n\
          No período analisado: {piso} de {total} roteamentos caíram no piso."
+    )
+}
+
+/// Monta a mensagem do alarme PERCENTUAL. `janela` é a descrição legível do período analisado
+/// (ex.: "24h") ou `None` para "todo o histórico".
+pub fn mensagem_alerta_percentual(
+    relatorio: &Relatorio,
+    limiar_percentual: u8,
+    janela: Option<&str>,
+) -> String {
+    let piso = relatorio.sucessos_no_piso();
+    let total = relatorio.total_roteamentos();
+    let pct = relatorio.percentual_no_piso();
+    let periodo = match janela {
+        Some(j) => format!("nas últimas {j}"),
+        None => "em todo o histórico".to_string(),
+    };
+    format!(
+        "⚠️ Roteador: {pct:.0}% dos roteamentos {periodo} caíram no piso (Ollama) — \
+         {piso} de {total} (limiar de alerta: {limiar_percentual}%).\n\
+         Mesmo sem quedas longas em série, a dependência do modelo local fraco está alta: \
+         a cadeia de provedores bons (Claude/Groq/Gemini) está respondendo pouco.\n\
+         Verifique: token do Claude (refresh) e chaves Groq/Gemini."
     )
 }
 
@@ -194,6 +287,98 @@ mod testes {
         assert_eq!(parsear_estado("  3 \n"), Ok(3));
         assert!(parsear_estado("lixo").is_err());
         assert_eq!(serializar_estado(7), "7\n");
+    }
+
+    #[test]
+    fn percentual_amostras_de_menos_nao_alerta_e_rearma() {
+        // 3 de 3 no piso = 100%, mas com mínimo de amostras 8 não dá pra concluir nada.
+        assert_eq!(
+            decidir_por_percentual(3, 3, 70, 8, false),
+            DecisaoPercentual {
+                notificar: false,
+                ja_em_alta: false
+            }
+        );
+        // Mesmo já estando "em alta", cair para poucas amostras re-arma (zera o estado).
+        assert_eq!(
+            decidir_por_percentual(2, 2, 70, 8, true),
+            DecisaoPercentual {
+                notificar: false,
+                ja_em_alta: false
+            }
+        );
+    }
+
+    #[test]
+    fn percentual_cruza_o_limiar_alerta_uma_vez() {
+        // 8 de 10 = 80% >= limiar 70, primeira vez (não estava em alta) -> alerta.
+        assert_eq!(
+            decidir_por_percentual(8, 10, 70, 8, false),
+            DecisaoPercentual {
+                notificar: true,
+                ja_em_alta: true
+            }
+        );
+        // Continua alto na próxima rodada: fica armado e quieto (anti-spam).
+        assert_eq!(
+            decidir_por_percentual(9, 10, 70, 8, true),
+            DecisaoPercentual {
+                notificar: false,
+                ja_em_alta: true
+            }
+        );
+    }
+
+    #[test]
+    fn percentual_zona_morta_mantem_o_estado() {
+        // Limiar 70, margem 15 -> recuperação em 55%. 60% está na zona morta: não realerta,
+        // mas também não re-arma (segura o estado para não ficar piscando).
+        assert_eq!(
+            decidir_por_percentual(6, 10, 70, 8, true),
+            DecisaoPercentual {
+                notificar: false,
+                ja_em_alta: true
+            }
+        );
+        // A mesma zona morta, mas sem estar em alta antes: continua sem alertar.
+        assert_eq!(
+            decidir_por_percentual(6, 10, 70, 8, false),
+            DecisaoPercentual {
+                notificar: false,
+                ja_em_alta: false
+            }
+        );
+    }
+
+    #[test]
+    fn percentual_recupera_com_folga_rearma() {
+        // 50% <= 55% (recuperação): fase de alta acabou, re-arma para a próxima.
+        assert_eq!(
+            decidir_por_percentual(5, 10, 70, 8, true),
+            DecisaoPercentual {
+                notificar: false,
+                ja_em_alta: false
+            }
+        );
+    }
+
+    #[test]
+    fn mensagem_percentual_traz_fracao_periodo_e_limiar() {
+        // 3 de 4 no piso = 75%; janela "24h".
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 31000ms
+2026-06-30 12:03:00 UTC [roteador] [ok] respondido por 'ollama_local' em 32000ms
+";
+        let relatorio = crate::metricas::agregar(log);
+        let msg = mensagem_alerta_percentual(&relatorio, 70, Some("24h"));
+        assert!(msg.contains("75% dos roteamentos nas últimas 24h"));
+        assert!(msg.contains("3 de 4"));
+        assert!(msg.contains("limiar de alerta: 70%"));
+        // Sem janela, descreve "todo o histórico".
+        let msg_total = mensagem_alerta_percentual(&relatorio, 70, None);
+        assert!(msg_total.contains("em todo o histórico"));
     }
 
     #[test]

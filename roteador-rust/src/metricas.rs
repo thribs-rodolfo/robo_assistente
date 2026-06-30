@@ -71,6 +71,18 @@ impl Relatorio {
             .sum()
     }
 
+    /// Fração (0.0–100.0) dos roteamentos que caíram no piso (Ollama). 0 quando não houve
+    /// nenhum roteamento. É a dependência expressa em porcentagem — base tanto do relatório
+    /// legível quanto do alarme percentual ([`crate::alerta::decidir_por_percentual`]).
+    pub fn percentual_no_piso(&self) -> f64 {
+        let total = self.total_roteamentos();
+        if total == 0 {
+            0.0
+        } else {
+            (self.sucessos_no_piso() as f64 / total as f64) * 100.0
+        }
+    }
+
     /// Atualiza as sequências de "caiu no piso" a cada `[ok]`, na ordem cronológica do log.
     /// Cada resposta de provedor bom zera a sequência atual; cada Ollama soma +1.
     fn registrar_sequencia(&mut self, nome: &str) {
@@ -282,11 +294,7 @@ impl std::fmt::Display for Relatorio {
         }
         writeln!(f, "total de roteamentos: {total}")?;
         let piso = self.sucessos_no_piso();
-        let pct = if total > 0 {
-            (piso as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
+        let pct = self.percentual_no_piso();
         writeln!(f, "caiu no piso (Ollama): {piso} de {total} ({pct:.1}%)")?;
         // Sequências de piso: alarme de dependência AGORA (atual) e pior momento (máxima).
         writeln!(
@@ -456,5 +464,20 @@ linha de ruído sem formato
         let texto = format!("{}", agregar(log));
         assert!(texto.contains("total de roteamentos: 2"));
         assert!(texto.contains("caiu no piso (Ollama): 1 de 2 (50.0%)"));
+    }
+
+    #[test]
+    fn percentual_no_piso_calcula_a_fracao() {
+        // 3 no piso de 4 roteamentos = 75%.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 31000ms
+2026-06-30 12:03:00 UTC [roteador] [ok] respondido por 'ollama_local' em 32000ms
+";
+        let r = agregar(log);
+        assert_eq!(r.percentual_no_piso(), 75.0);
+        // Sem roteamento nenhum, não divide por zero: fica 0%.
+        assert_eq!(agregar("").percentual_no_piso(), 0.0);
     }
 }
