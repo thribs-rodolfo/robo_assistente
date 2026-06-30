@@ -223,8 +223,25 @@ pub fn corpo_send_message(chat: i64, texto: &str) -> String {
     .para_texto()
 }
 
-/// Envia uma mensagem de texto via API do Telegram (`sendMessage`, HTTPS).
+/// Limite de caracteres por mensagem no Telegram. O limite oficial é 4096; usamos uma
+/// margem (4000) por segurança, já que o Telegram conta em unidades UTF-16 e não em chars.
+const LIMITE_TELEGRAM: usize = 4000;
+
+/// Envia uma resposta via Telegram, quebrando em várias mensagens se passar do limite.
+///
+/// Sem a quebra, uma resposta longa (Claude às vezes responde muito) faria o `sendMessage`
+/// devolver HTTP 400 e o usuário ficaria SEM resposta. Aqui dividimos em partes e mandamos
+/// cada uma; se qualquer parte falhar, devolvemos o erro (sem engolir).
 pub fn enviar_mensagem(token: &str, chat: i64, texto: &str) -> Result<(), FalhaProvedor> {
+    let partes = dividir_resposta(texto, LIMITE_TELEGRAM);
+    for parte in partes {
+        enviar_parte(token, chat, &parte)?;
+    }
+    Ok(())
+}
+
+/// Envia UMA mensagem (uma parte já dentro do limite) via `sendMessage`.
+fn enviar_parte(token: &str, chat: i64, texto: &str) -> Result<(), FalhaProvedor> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     let corpo = corpo_send_message(chat, texto);
     let resposta = https::post_json(&url, &corpo, &[], TIMEOUT_TELEGRAM)?;
@@ -236,6 +253,37 @@ pub fn enviar_mensagem(token: &str, chat: i64, texto: &str) -> Result<(), FalhaP
             corpo: resposta.corpo,
         })
     }
+}
+
+/// Divide um texto em partes de no máximo `limite` caracteres, preferindo quebrar em uma
+/// quebra de linha dentro da janela (resposta mais legível). Se não houver `\n` útil, corta
+/// no limite. Texto vazio vira uma única parte vazia (deixa o Telegram recusar com clareza).
+pub fn dividir_resposta(texto: &str, limite: usize) -> Vec<String> {
+    let total = texto.chars().count();
+    if total <= limite {
+        return vec![texto.to_string()];
+    }
+
+    let mut partes = Vec::new();
+    let chars: Vec<char> = texto.chars().collect();
+    let mut inicio = 0;
+    while inicio < chars.len() {
+        let fim_max = (inicio + limite).min(chars.len());
+        // Tenta quebrar na última '\n' dentro da janela (sem cortar no meio de uma linha).
+        let corte = if fim_max < chars.len() {
+            (inicio..fim_max)
+                .rev()
+                .find(|&i| chars[i] == '\n')
+                .map(|i| i + 1) // inclui a quebra na parte atual
+                .unwrap_or(fim_max)
+        } else {
+            fim_max
+        };
+        let parte: String = chars[inicio..corte].iter().collect();
+        partes.push(parte);
+        inicio = corte;
+    }
+    partes
 }
 
 /// Processa um update completo de um bot: extrai a mensagem, checa autorização,
@@ -388,5 +436,40 @@ mod testes {
     fn allow_from_inline_aceita_numero_e_texto() {
         let valor = json::parsear(r#"{"allow_from":[111,"222"]}"#).unwrap();
         assert_eq!(lista_permitidos(&valor), vec!["111", "222"]);
+    }
+
+    #[test]
+    fn resposta_curta_fica_em_uma_parte_so() {
+        assert_eq!(dividir_resposta("oi", 4000), vec!["oi"]);
+        // Exatamente no limite ainda é uma parte.
+        let no_limite = "a".repeat(10);
+        assert_eq!(dividir_resposta(&no_limite, 10), vec![no_limite]);
+    }
+
+    #[test]
+    fn resposta_longa_quebra_em_partes_dentro_do_limite() {
+        let texto = "a".repeat(25);
+        let partes = dividir_resposta(&texto, 10);
+        assert_eq!(partes.len(), 3); // 10 + 10 + 5
+        assert!(partes.iter().all(|p| p.chars().count() <= 10));
+        assert_eq!(partes.concat(), texto); // nada se perde
+    }
+
+    #[test]
+    fn quebra_prefere_a_quebra_de_linha() {
+        // Duas linhas; com limite 8, deve cortar logo após o '\n' (na posição 6), não no meio.
+        let texto = "linha\nmais conteudo aqui";
+        let partes = dividir_resposta(texto, 8);
+        assert_eq!(partes[0], "linha\n");
+        assert_eq!(partes.concat(), texto);
+    }
+
+    #[test]
+    fn quebra_respeita_fronteira_utf8() {
+        // Caracteres multibyte não podem ser cortados no meio (contamos por char, não byte).
+        let texto = "áéíóú".repeat(4); // 20 chars
+        let partes = dividir_resposta(&texto, 7);
+        assert!(partes.iter().all(|p| p.chars().count() <= 7));
+        assert_eq!(partes.concat(), texto);
     }
 }
