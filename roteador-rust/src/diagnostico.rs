@@ -27,6 +27,9 @@ use crate::json::{self, Valor};
 pub enum ResultadoPiso {
     /// Piso vivo e com o modelo esperado instalado — a rede de segurança está de pé.
     Saudavel { nome: String, modelo: String },
+    /// Piso do tipo `resposta_fixa`: não tem o que sondar (é local, sem rede/processo) e,
+    /// tendo `mensagem_fixa` configurada, está trivialmente vivo — nunca fica mudo.
+    RespostaFixaViva { nome: String },
     /// Servidor respondeu, mas o modelo configurado NÃO está entre os instalados. A geração
     /// falharia; guardamos os modelos disponíveis para o operador ver o que há.
     ModeloFaltando {
@@ -63,6 +66,7 @@ impl ResultadoPiso {
     pub fn severidade(&self) -> Severidade {
         match self {
             ResultadoPiso::Saudavel { .. } => Severidade::Ok,
+            ResultadoPiso::RespostaFixaViva { .. } => Severidade::Ok,
             ResultadoPiso::NaoSondavel { .. } => Severidade::NaoVerificado,
             ResultadoPiso::ModeloFaltando { .. }
             | ResultadoPiso::ForaDoAr { .. }
@@ -81,6 +85,10 @@ impl std::fmt::Display for ResultadoPiso {
                     "✅ Piso '{nome}' vivo e com o modelo '{modelo}' instalado."
                 )
             }
+            ResultadoPiso::RespostaFixaViva { nome } => write!(
+                f,
+                "✅ Piso '{nome}' é 'resposta_fixa' (texto local): sempre vivo, nunca fica mudo."
+            ),
             ResultadoPiso::ModeloFaltando {
                 nome,
                 modelo,
@@ -208,6 +216,27 @@ pub fn verificar_piso(config: &Config) -> ResultadoPiso {
     if !piso.habilitado {
         return ResultadoPiso::Desabilitado {
             nome: piso.nome.clone(),
+        };
+    }
+
+    // Piso 'resposta_fixa': não há rede/processo a sondar. Está vivo por construção DESDE que
+    // tenha 'mensagem_fixa' com texto — senão ficaria indisponível (pulado) e o robô mudo.
+    if piso.tipo == "resposta_fixa" {
+        let tem_texto = piso
+            .mensagem_fixa
+            .as_deref()
+            .map(str::trim)
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        return if tem_texto {
+            ResultadoPiso::RespostaFixaViva {
+                nome: piso.nome.clone(),
+            }
+        } else {
+            ResultadoPiso::ForaDoAr {
+                nome: piso.nome.clone(),
+                detalhe: "piso resposta_fixa sem 'mensagem_fixa' — ficaria indisponível".into(),
+            }
         };
     }
 
@@ -367,6 +396,37 @@ mod testes {
         let r = verificar_piso(&config);
         assert_eq!(r.severidade(), Severidade::NaoVerificado);
         assert!(matches!(r, ResultadoPiso::NaoSondavel { .. }));
+    }
+
+    #[test]
+    fn piso_resposta_fixa_com_texto_e_vivo_sem_tocar_rede() {
+        // Piso resposta_fixa com mensagem → vivo por construção (nenhum socket é aberto).
+        let bruto = r#"{
+            "ordem_fallback":["cortesia"],
+            "provedores":{"cortesia":{"tipo":"resposta_fixa","mensagem_fixa":"volto já"}}
+        }"#;
+        let config = interpretar(bruto).unwrap();
+        let r = verificar_piso(&config);
+        assert_eq!(r.severidade(), Severidade::Ok);
+        assert_eq!(
+            r,
+            ResultadoPiso::RespostaFixaViva {
+                nome: "cortesia".into()
+            }
+        );
+    }
+
+    #[test]
+    fn piso_resposta_fixa_sem_texto_e_comprometido() {
+        // Sem 'mensagem_fixa' ele ficaria indisponível (pulado) → piso comprometido.
+        let bruto = r#"{
+            "ordem_fallback":["cortesia"],
+            "provedores":{"cortesia":{"tipo":"resposta_fixa"}}
+        }"#;
+        let config = interpretar(bruto).unwrap();
+        let r = verificar_piso(&config);
+        assert_eq!(r.severidade(), Severidade::Comprometido);
+        assert!(matches!(r, ResultadoPiso::ForaDoAr { .. }));
     }
 
     #[test]

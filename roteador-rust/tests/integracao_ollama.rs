@@ -26,6 +26,7 @@ fn ollama_local_responde_de_verdade() {
             modelo: Some("qwen2.5:1.5b".into()),
             comando: None,
             chave: None,
+            mensagem_fixa: None,
             timeout: Duration::from_secs(120),
             habilitado: true,
             retentativas: 0,

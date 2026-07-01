@@ -353,6 +353,7 @@ mod testes {
             modelo: None,
             comando: None,
             chave: None,
+            mensagem_fixa: None,
             timeout: Duration::from_secs(1),
             habilitado: true,
             retentativas,

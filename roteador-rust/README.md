@@ -48,7 +48,7 @@ e citar o nome na `ordem_fallback`.
 | `prompt.rs`     | Monta prompt/mensagens a partir de (mensagem, contexto)         |
 | `erro.rs`       | Erros tipados: `FalhaProvedor`, `ErroRoteador`                  |
 | `config.rs`     | Lê a config JSON dos provedores (fora do repo)                  |
-| `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini             |
+| `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini, resposta fixa |
 | `telemetria.rs` | Log de quem respondeu e por que caiu                            |
 | `metricas.rs`   | Lê o log e agrega: de quem o robô realmente depende             |
 | `alerta.rs`     | Decide (função pura) quando avisar o Thiago que caiu no piso    |
@@ -96,6 +96,39 @@ escondido: os testes apontam para um arquivo temporário e o roteamento fica **h
 — antes, rodar `cargo test` gravava linhas de teste (portas mortas) no log de produção e
 **contaminava as métricas** do `bin/metricas` (a medida de "% no piso", que é o objetivo
 do projeto). Produção não precisa declará-lo.
+
+## Piso de última instância: provedor `resposta_fixa`
+
+A garantia central do projeto é **"o robô nunca fica mudo"**, e ela repousa no piso (o
+Ollama local, último da ordem). Mas o Ollama **pode cair** (processo morto, máquina sem
+recurso). Nesse caso a cadeia inteira falha e o `rotear` devolve `TodosFalharam` — o usuário
+fica sem resposta.
+
+O provedor **`resposta_fixa`** fecha esse buraco. É o provedor mais simples possível: não
+fala com rede, não sobe processo, não usa chave — só devolve um texto fixo da config
+(`mensagem_fixa`). Posto como **último** da `ordem_fallback` (abaixo do Ollama), ele garante
+que a cadeia **nunca** devolve `TodosFalharam`: se até o Ollama cair, o robô ainda entrega
+uma mensagem de cortesia em vez de silêncio.
+
+```json
+"ordem_fallback": ["claude", "ollama_local", "cortesia"],
+"provedores": {
+  "cortesia": {"tipo": "resposta_fixa",
+               "mensagem_fixa": "Estou com uma instabilidade técnica agora. Tente de novo em instantes."}
+}
+```
+
+- **Nunca dispara o Claude** nem qualquer serviço — é 100% local e determinístico.
+- Sem `mensagem_fixa` (ou vazia) ele fica **indisponível** e é pulado; o `bin/verificar-config`
+  marca isso como **erro** antes do deploy (piso não pode quebrar em silêncio).
+- Os dois "doutores" reconhecem o novo piso: `verificar-config` aceita `resposta_fixa` como
+  piso legítimo (local, nunca mudo) e o `bin/diagnostico` o reporta como **sempre vivo**
+  (não há rede a sondar), em vez de "não verificado".
+
+> Nota: a ponte Telegram já manda um aviso de cortesia embutido quando o `rotear` devolve
+> `TodosFalharam`. O `resposta_fixa` leva essa garantia para **dentro** do roteador, de modo
+> que **qualquer** chamador de `rotear()` (a ponte, o `bin/roteador`, outra ferramenta)
+> herde o piso — defesa em profundidade, configurável e testável.
 
 ## Disjuntor / circuit breaker (`disjuntor`)
 
@@ -237,6 +270,18 @@ cargo build --release
 # [provedor: ollama_local]
 # Paris.
 ```
+
+⚠️ **A config padrão começa pelo Claude.** Rodar `roteador "..."` sem override **dispara o
+Claude** (`claude --print`) — o que contraria a regra de nunca acionar o Claude "só pra
+testar" (`licao-refresh-token-rotativo`). Para exercitar o roteador sem tocar o Claude,
+aponte a env `ROTEADOR_CONFIG` para uma config cuja ordem **não** tenha o Claude (ex.: só
+Ollama, ou um piso `resposta_fixa`):
+
+```sh
+ROTEADOR_CONFIG=/tmp/so-ollama.json ./target/release/roteador "oi"
+```
+
+O binário da ponte já usava esse mesmo override; o `bin/roteador` agora também, por simetria.
 
 ## Métricas (`bin/metricas`)
 
@@ -541,10 +586,10 @@ checa:
 | `ordem_fallback` vazia | erro |
 | nome na ordem sem provedor declarado | erro |
 | tipo de provedor desconhecido | erro |
-| campo obrigatório faltando (ollama sem `url_base`/`modelo`, etc.) | erro |
+| campo obrigatório faltando (ollama sem `url_base`/`modelo`, `resposta_fixa` sem `mensagem_fixa`, etc.) | erro |
 | **piso (último) desabilitado** | erro |
 | **piso do tipo que exige chave** (openai_compat/gemini_rest) | erro |
-| piso do tipo que não é `ollama` (ex.: claude como último) | aviso |
+| piso do tipo que não é `ollama`/`resposta_fixa` (ex.: claude como último) | aviso |
 | nome repetido na ordem | aviso |
 | provedor declarado fora da ordem (nunca usado) | aviso |
 | provedor habilitado sem `chave` (será pulado sempre) | aviso |
@@ -588,9 +633,9 @@ Código de saída (útil em cron: `diagnostico || avisar-thiago`):
 
 | Saída | Significado |
 |-------|-------------|
-| **0** | piso vivo e com o modelo certo instalado |
+| **0** | piso vivo e com o modelo certo instalado (ou piso `resposta_fixa` com texto → sempre vivo) |
 | **1** | piso **comprometido**: fora do ar, sem o modelo, desabilitado, ou inexistente |
-| **2** | não deu para verificar (piso não é Ollama → não sondamos) |
+| **2** | não deu para verificar (piso não é Ollama nem `resposta_fixa` → não sondamos) |
 
 Exemplos reais (provados ao vivo, Claude jamais tocado):
 

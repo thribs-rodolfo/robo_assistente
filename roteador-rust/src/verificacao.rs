@@ -174,7 +174,21 @@ pub fn verificar(config: &Config) -> Vec<Achado> {
                     "gemini '{nome}' sem 'modelo': falharia em toda tentativa"
                 )));
             }
-            _ => {} // gemini com modelo / claude_cli: nada obrigatório a mais
+            // resposta_fixa precisa de 'mensagem_fixa' com texto real (só espaços não vale):
+            // sem ela o provedor fica indisponível e não cumpre o papel de piso.
+            "resposta_fixa"
+                if provedor_config
+                    .mensagem_fixa
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty() =>
+            {
+                achados.push(Achado::erro(format!(
+                    "resposta_fixa '{nome}' sem 'mensagem_fixa' (ou vazia): ficaria indisponível em toda tentativa"
+                )));
+            }
+            _ => {} // gemini com modelo / claude_cli / resposta_fixa com texto: nada a mais
         }
 
         // Habilitado + exige chave + sem chave: o roteador o pula em toda mensagem. É o
@@ -205,9 +219,12 @@ pub fn verificar(config: &Config) -> Vec<Achado> {
                     "piso '{nome_piso}' é do tipo '{}', que EXIGE chave externa: o piso não pode depender de chave/cota — use o Ollama local como último da ordem",
                     piso.tipo
                 )));
-            } else if piso.tipo != "ollama" {
+            } else if piso.tipo != "ollama" && piso.tipo != "resposta_fixa" {
+                // 'ollama' (modelo local) e 'resposta_fixa' (texto local) são pisos legítimos:
+                // nenhum depende de rede/chave externa, então nunca deixam o robô mudo. Qualquer
+                // outro tipo como último é suspeito.
                 achados.push(Achado::aviso(format!(
-                    "piso '{nome_piso}' é do tipo '{}', não 'ollama': o piso deveria ser o modelo local, que nunca depende de rede/chave externa e por isso nunca fica mudo",
+                    "piso '{nome_piso}' é do tipo '{}', não 'ollama'/'resposta_fixa': o piso deveria ser local (modelo Ollama ou resposta fixa), que nunca depende de rede/chave externa e por isso nunca fica mudo",
                     piso.tipo
                 )));
             }
@@ -389,6 +406,37 @@ mod testes {
         assert!(achados
             .iter()
             .any(|a| a.mensagem.contains("'groq'") && a.mensagem.contains("sem 'chave'")));
+    }
+
+    #[test]
+    fn piso_resposta_fixa_e_valido_sem_achado() {
+        // resposta_fixa como piso (abaixo do Ollama) é um piso legítimo: local, nunca mudo.
+        let achados = verificar_json(
+            r#"{
+                "ordem_fallback": ["ollama_local", "cortesia"],
+                "provedores": {
+                    "ollama_local": {"tipo":"ollama","url_base":"http://x","modelo":"m"},
+                    "cortesia": {"tipo":"resposta_fixa","mensagem_fixa":"Tente de novo em instantes."}
+                }
+            }"#,
+        );
+        assert!(
+            achados.is_empty(),
+            "esperava zero achados, veio: {achados:?}"
+        );
+    }
+
+    #[test]
+    fn resposta_fixa_sem_mensagem_e_erro() {
+        // resposta_fixa sem 'mensagem_fixa' (aqui como piso) ficaria indisponível → erro.
+        let achados = verificar_json(
+            r#"{"ordem_fallback":["cortesia"],
+                "provedores":{"cortesia":{"tipo":"resposta_fixa"}}}"#,
+        );
+        assert!(tem_erro(&achados));
+        assert!(achados
+            .iter()
+            .any(|a| a.mensagem.contains("resposta_fixa") && a.mensagem.contains("mensagem_fixa")));
     }
 
     #[test]

@@ -36,6 +36,12 @@ pub struct ConfigProvedor {
     pub comando: Option<String>,
     /// Chave de API (Groq/Gemini). `None` quando não se aplica.
     pub chave: Option<String>,
+    /// Texto fixo devolvido pelo provedor `resposta_fixa` (piso de última instância que
+    /// NUNCA falha: sem rede, sem processo, sem chave). Ignorado pelos outros tipos. Serve
+    /// para garantir que a cadeia jamais fique muda mesmo se o Ollama cair — o robô devolve
+    /// esta mensagem de cortesia em vez de silêncio. `None`/vazio => o provedor fica
+    /// indisponível (a verificação estática avisa antes de ir para produção).
+    pub mensagem_fixa: Option<String>,
     /// Timeout em segundos para a chamada deste provedor.
     pub timeout: Duration,
     /// Se `false`, o provedor é pulado na pré-checagem (não tenta nem a rede).
@@ -277,6 +283,7 @@ fn interpretar_provedor(nome: &str, valor: &Valor) -> Result<ConfigProvedor, Err
         modelo: texto_opcional("modelo"),
         comando: texto_opcional("comando"),
         chave: texto_opcional("chave"),
+        mensagem_fixa: texto_opcional("mensagem_fixa"),
         timeout: Duration::from_secs(timeout_segundos),
         habilitado,
         retentativas,
@@ -401,6 +408,23 @@ mod testes {
         let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"disjuntor":{"habilitado":true,"sombra":true}}"#;
         let config = interpretar(bruto).unwrap();
         assert!(config.disjuntor.sombra);
+    }
+
+    #[test]
+    fn mensagem_fixa_ausente_e_none_por_padrao() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.provedor("g").unwrap().mensagem_fixa, None);
+    }
+
+    #[test]
+    fn mensagem_fixa_e_lida_quando_presente() {
+        let bruto = r#"{"ordem_fallback":["fixo"],"provedores":{"fixo":{"tipo":"resposta_fixa","mensagem_fixa":"Estou indisponível, tente já já."}}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(
+            config.provedor("fixo").unwrap().mensagem_fixa.as_deref(),
+            Some("Estou indisponível, tente já já.")
+        );
     }
 
     #[test]

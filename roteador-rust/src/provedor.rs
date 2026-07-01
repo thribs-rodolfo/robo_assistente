@@ -45,6 +45,9 @@ pub fn construir(config: &ConfigProvedor) -> Option<Box<dyn Provedor>> {
         "gemini_rest" => Some(Box::new(ProvedorGeminiRest {
             config: config.clone(),
         })),
+        "resposta_fixa" => Some(Box::new(ProvedorRespostaFixa {
+            config: config.clone(),
+        })),
         _ => None,
     }
 }
@@ -442,6 +445,63 @@ impl Provedor for ProvedorGeminiRest {
     }
 }
 
+// --------------------------------------------------------------------------- //
+// Resposta fixa — piso de ÚLTIMA instância que NUNCA falha.
+//
+// Não fala com rede, não sobe processo, não usa chave: só devolve um texto fixo da config
+// (`mensagem_fixa`). Serve para uma garantia mais forte do que "o robô quase nunca fica
+// mudo": se até o Ollama local cair, a cadeia ainda entrega uma mensagem de cortesia em vez
+// de silêncio — o `rotear` deixa de poder devolver `TodosFalharam` quando este provedor
+// fecha a ordem. É o provedor mais simples possível (bom exemplo didático do trait) e o
+// candidato ideal a ÚLTIMO da `ordem_fallback`, abaixo do Ollama.
+//
+// Nunca dispara o Claude nem qualquer serviço — é 100% local e determinístico.
+// --------------------------------------------------------------------------- //
+struct ProvedorRespostaFixa {
+    config: ConfigProvedor,
+}
+
+impl ProvedorRespostaFixa {
+    /// A mensagem configurada, já sem espaços nas pontas — ou `None` se ausente/vazia.
+    /// Centraliza a regra "vazio conta como não-configurado" usada por `disponivel`/`responder`.
+    fn texto_configurado(&self) -> Option<&str> {
+        self.config
+            .mensagem_fixa
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+}
+
+impl Provedor for ProvedorRespostaFixa {
+    fn nome(&self) -> &str {
+        &self.config.nome
+    }
+
+    fn disponivel(&self) -> Result<(), FalhaProvedor> {
+        if !self.config.habilitado {
+            return Err(FalhaProvedor::Indisponivel("desabilitado na config".into()));
+        }
+        // Sem texto configurado não temos o que responder: fica indisponível (e a verificação
+        // estática avisa antes de ir para produção, para o piso não quebrar em silêncio).
+        if self.texto_configurado().is_none() {
+            return Err(FalhaProvedor::Indisponivel(
+                "resposta_fixa sem 'mensagem_fixa' (ou vazia)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn responder(&self, _mensagem: &str, _contexto: &Contexto) -> Result<String, FalhaProvedor> {
+        // Ignora a mensagem/contexto de propósito: é uma resposta fixa. Como `disponivel`
+        // já garantiu que há texto, aqui não deveria faltar; ainda assim tratamos o caso
+        // sem `unwrap` (nunca em produção), devolvendo falha tipada em vez de pânico.
+        self.texto_configurado()
+            .map(str::to_string)
+            .ok_or_else(|| FalhaProvedor::Indisponivel("resposta_fixa sem 'mensagem_fixa'".into()))
+    }
+}
+
 #[cfg(test)]
 mod testes {
     use super::*;
@@ -455,6 +515,7 @@ mod testes {
             modelo: Some("qwen2.5:1.5b".into()),
             comando: None,
             chave: None,
+            mensagem_fixa: None,
             timeout: Duration::from_secs(5),
             habilitado,
             retentativas: 0,
@@ -468,6 +529,58 @@ mod testes {
         assert!(construir(&config_de("claude_cli", true)).is_some());
         assert!(construir(&config_de("openai_compat", true)).is_some());
         assert!(construir(&config_de("gemini_rest", true)).is_some());
+        assert!(construir(&config_de("resposta_fixa", true)).is_some());
+    }
+
+    /// Helper: config de um provedor `resposta_fixa` com a mensagem dada (ou nenhuma).
+    fn config_resposta_fixa(mensagem: Option<&str>, habilitado: bool) -> ConfigProvedor {
+        ConfigProvedor {
+            nome: "piso_fixo".into(),
+            tipo: "resposta_fixa".into(),
+            url_base: None,
+            modelo: None,
+            comando: None,
+            chave: None,
+            mensagem_fixa: mensagem.map(str::to_string),
+            timeout: Duration::from_secs(5),
+            habilitado,
+            retentativas: 0,
+            retentativa_espera_ms: 250,
+        }
+    }
+
+    #[test]
+    fn resposta_fixa_devolve_o_texto_configurado() {
+        let cfg = config_resposta_fixa(Some("Estou indisponível, tente já já."), true);
+        let provedor = construir(&cfg).unwrap();
+        assert!(provedor.disponivel().is_ok());
+        let texto = provedor
+            .responder("qualquer coisa", &Contexto::vazio())
+            .unwrap();
+        assert_eq!(texto, "Estou indisponível, tente já já.");
+    }
+
+    #[test]
+    fn resposta_fixa_sem_mensagem_fica_indisponivel() {
+        // Sem 'mensagem_fixa' (ou vazia/só espaços) não há o que responder → indisponível.
+        for mensagem in [None, Some(""), Some("   ")] {
+            let cfg = config_resposta_fixa(mensagem, true);
+            let provedor = construir(&cfg).unwrap();
+            assert!(matches!(
+                provedor.disponivel(),
+                Err(FalhaProvedor::Indisponivel(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn resposta_fixa_desabilitada_fica_indisponivel() {
+        let cfg = config_resposta_fixa(Some("oi"), false);
+        let provedor = construir(&cfg).unwrap();
+        assert!(matches!(
+            provedor.disponivel(),
+            Err(FalhaProvedor::Indisponivel(_))
+        ));
     }
 
     #[test]
@@ -529,6 +642,7 @@ mod testes {
             modelo: None,
             comando: Some(comando.to_string_lossy().into_owned()),
             chave: None,
+            mensagem_fixa: None,
             timeout,
             habilitado: true,
             retentativas: 0,
