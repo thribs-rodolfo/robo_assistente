@@ -257,6 +257,39 @@ realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar �
 A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
 mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
 
+### Falhas por motivo (o "por quê" da queda)
+
+A contagem de `falha` diz **quanto**; ela sozinha não diz **por quê**. Quando um provedor
+tem falhas, o relatório abre uma linha com o motivo, deduzido do log:
+
+```
+- claude: 3 ok, 12 falha, 0 pulo, 0 cfg | 850ms média
+    ↳ falhas por motivo: auth 9, timeout/5xx 3
+falhas por motivo (total): auth 9, timeout/5xx 3, rede 2
+```
+
+É o sinal **mais acionável** do relatório: o Claude falhando por **`auth`** (HTTP 401/403)
+é o token rotativo caindo — problema de credencial, não de rede; falhando por
+**`timeout/5xx`** é lentidão/instabilidade do serviço. Dois problemas diferentes que a
+contagem crua confunde. Categorias:
+
+| motivo (`rótulo` / `chave` JSON)        | de onde vem                                  |
+|-----------------------------------------|----------------------------------------------|
+| `auth` / `autenticacao`                 | HTTP 401/403 (credencial recusada)           |
+| `rate-limit` / `limite_taxa`            | HTTP 429 (estourou a cota)                    |
+| `timeout/5xx` / `servidor_instavel`     | HTTP 408 ou 5xx (servidor sobrecarregado)     |
+| `rede` / `rede`                         | conexão recusada, host fora, socket estourou |
+| `processo` / `processo`                 | `claude --print` falhou/travou                |
+| `req-inválida` / `requisicao_invalida`  | HTTP 400/404/413/422 (problema DESTA mensagem)|
+| `resposta-ruim` / `resposta_ruim`       | respondeu vazio ou em formato inesperado      |
+| `config` / `configuracao`               | desabilitado / sem chave / sem url_base       |
+| `outra` / `outra`                       | motivo não reconhecido (formato antigo)       |
+
+A soma das categorias de um provedor sempre bate com o total de `falha` dele. No `--json`,
+cada provedor ganha um objeto `falhas_por_categoria` (chaves estáveis em snake_case) e há
+um agregado de mesmo nome no topo. Como toda a métrica, é **só leitura** — jamais dispara
+provedor (o Claude nunca é tocado).
+
 ### Latência: média + percentis (performance)
 
 A latência aparece por provedor. Com **2 ou mais respostas**, além da média mostramos

@@ -57,6 +57,76 @@ pub struct MetricasProvedor {
     /// dependência em TEMPO DE PAREDE — complementa a sequência, que conta EVENTOS: um bot com
     /// pouco tráfego pode ter sequência 3 mas estar sem provedor bom há horas.
     pub ultimo_sucesso_epoch: Option<u64>,
+    /// Quantas falhas de cada CATEGORIA este provedor teve (auth, rate-limit, timeout, rede,
+    /// processo...). A contagem de `falhas` sozinha diz QUANTO, não POR QUÊ; isto abre o "por
+    /// quê". É o sinal mais acionável do relatório: o Claude falhando por AUTENTICAÇÃO é o token
+    /// rotativo caindo ([[licao-refresh-token-rotativo]]); falhando por TIMEOUT é lentidão — dois
+    /// problemas diferentes que a contagem crua confunde. A soma dos valores == `falhas`.
+    pub falhas_por_categoria: BTreeMap<CategoriaFalha, u64>,
+}
+
+/// Por que um provedor falhou, deduzido do motivo que o [`crate::lib`] gravou no log.
+///
+/// Cada `[falha] <nome>: <motivo> ...` carrega o [`Display`](std::fmt::Display) de uma
+/// [`FalhaProvedor`](crate::erro::FalhaProvedor) (`http 401: ...`, `rede: ...`, `processo:
+/// ...`). Aqui traduzimos esse motivo de volta para uma categoria estável, para o relatório
+/// responder "de que MORREU cada provedor". É telemetria só-leitura: nada dispara provedor.
+///
+/// `Ord`/`Eq` derivados para servir de chave de `BTreeMap` (saída ordenada e determinística).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CategoriaFalha {
+    /// Autenticação recusada (HTTP 401/403). No Claude, é o sintoma do token rotativo caindo.
+    Autenticacao,
+    /// Limite de taxa estourado (HTTP 429): bateu na cota momentânea do provedor.
+    LimiteTaxa,
+    /// Timeout (HTTP 408) ou erro do servidor (5xx): provedor sobrecarregado/instável.
+    ServidorInstavel,
+    /// Rede/conexão: provedor fora do ar, host inacessível, socket estourou.
+    Rede,
+    /// Processo externo (`claude --print`) falhou: não encontrado, código != 0, travou/timeout.
+    Processo,
+    /// Requisição rejeitada pelo conteúdo (HTTP 400/404/413/422): problema DESTA mensagem, não
+    /// do provedor (ele está de pé). Separada de propósito — não indica dependência do piso.
+    RequisicaoInvalida,
+    /// O provedor respondeu, mas vazio ou em formato inesperado (falha de contrato, não de saúde).
+    RespostaRuim,
+    /// Pré-checagem/config reprovou (desabilitado, sem chave, sem url_base).
+    Configuracao,
+    /// Motivo não reconhecido (formato antigo/desconhecido). Nunca deveria dominar — se dominar,
+    /// é sinal de que o formato do log mudou e este parser precisa acompanhar.
+    Outra,
+}
+
+impl CategoriaFalha {
+    /// Rótulo curto para o relatório em texto (ex.: `auth`, `timeout/5xx`).
+    pub fn rotulo(&self) -> &'static str {
+        match self {
+            CategoriaFalha::Autenticacao => "auth",
+            CategoriaFalha::LimiteTaxa => "rate-limit",
+            CategoriaFalha::ServidorInstavel => "timeout/5xx",
+            CategoriaFalha::Rede => "rede",
+            CategoriaFalha::Processo => "processo",
+            CategoriaFalha::RequisicaoInvalida => "req-inválida",
+            CategoriaFalha::RespostaRuim => "resposta-ruim",
+            CategoriaFalha::Configuracao => "config",
+            CategoriaFalha::Outra => "outra",
+        }
+    }
+
+    /// Chave estável (snake_case, sem acento/espaço) para o JSON — boa para consumo por máquina.
+    pub fn chave(&self) -> &'static str {
+        match self {
+            CategoriaFalha::Autenticacao => "autenticacao",
+            CategoriaFalha::LimiteTaxa => "limite_taxa",
+            CategoriaFalha::ServidorInstavel => "servidor_instavel",
+            CategoriaFalha::Rede => "rede",
+            CategoriaFalha::Processo => "processo",
+            CategoriaFalha::RequisicaoInvalida => "requisicao_invalida",
+            CategoriaFalha::RespostaRuim => "resposta_ruim",
+            CategoriaFalha::Configuracao => "configuracao",
+            CategoriaFalha::Outra => "outra",
+        }
+    }
 }
 
 impl MetricasProvedor {
@@ -94,6 +164,16 @@ impl MetricasProvedor {
     pub fn latencia_maxima_ms(&self) -> Option<u128> {
         self.latencias_ms.iter().copied().max()
     }
+
+    /// Resumo das falhas por categoria em uma linha (ex.: `auth 3, rede 2`), ou string vazia
+    /// quando não houve falha. Itera o `BTreeMap` (ordenado pela ordem do enum) → saída estável.
+    pub fn resumo_falhas(&self) -> String {
+        self.falhas_por_categoria
+            .iter()
+            .map(|(cat, n)| format!("{} {n}", cat.rotulo()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Relatório agregado de todo o log: um mapa de provedor -> métricas, ordenado por nome.
@@ -129,6 +209,19 @@ impl Relatorio {
     /// ou os provedores remotos andaram).
     pub fn total_retentativas(&self) -> u64 {
         self.por_provedor.values().map(|m| m.retentativas).sum()
+    }
+
+    /// Falhas por categoria somando TODOS os provedores — "de que os provedores morreram no
+    /// período, no agregado". Complementa a visão por provedor: aqui vê-se, por exemplo, que
+    /// metade de todas as falhas foi de autenticação (token) sem precisar somar de cabeça.
+    pub fn falhas_por_categoria_total(&self) -> BTreeMap<CategoriaFalha, u64> {
+        let mut total: BTreeMap<CategoriaFalha, u64> = BTreeMap::new();
+        for m in self.por_provedor.values() {
+            for (cat, n) in &m.falhas_por_categoria {
+                *total.entry(*cat).or_insert(0) += *n;
+            }
+        }
+        total
     }
 
     /// Total de pulos que o disjuntor em modo SOMBRA acertaria (previsão certa) no período.
@@ -316,6 +409,15 @@ impl Relatorio {
             Some(e) => Valor::Numero(e as f64),
             None => Valor::Nulo,
         };
+        // Mapa de categoria->contagem -> objeto JSON com chaves estáveis (snake_case). Objeto
+        // vazio quando não houve falha — igual ao texto, que omite a linha nesse caso.
+        let objeto_categorias = |mapa: &BTreeMap<CategoriaFalha, u64>| {
+            Valor::Objeto(
+                mapa.iter()
+                    .map(|(cat, n)| (cat.chave().to_string(), Valor::Numero(*n as f64)))
+                    .collect(),
+            )
+        };
 
         // Um objeto por provedor. Iteramos o BTreeMap (já ordenado por nome) → saída
         // determinística, boa para diff e para testes.
@@ -369,6 +471,10 @@ impl Relatorio {
                     "ultimo_sucesso_epoch".into(),
                     epoch_ou_nulo(metricas.ultimo_sucesso_epoch),
                 ),
+                (
+                    "falhas_por_categoria".into(),
+                    objeto_categorias(&metricas.falhas_por_categoria),
+                ),
             ]);
             provedores.push((nome.clone(), objeto_provedor));
         }
@@ -421,6 +527,10 @@ impl Relatorio {
             (
                 "sombra_falsos_positivos".into(),
                 Valor::Numero(self.total_sombra_falsos_positivos() as f64),
+            ),
+            (
+                "falhas_por_categoria".into(),
+                objeto_categorias(&self.falhas_por_categoria_total()),
             ),
             (
                 "linhas_ignoradas".into(),
@@ -544,6 +654,7 @@ enum Evento {
     },
     Falha {
         nome: String,
+        categoria: CategoriaFalha,
     },
     Pulo {
         nome: String,
@@ -583,7 +694,11 @@ impl Evento {
                 // é robusto a linhas fora de ordem). `None` de carimbo ilegível não sobrescreve.
                 m.ultimo_sucesso_epoch = m.ultimo_sucesso_epoch.max(carimbo);
             }
-            Evento::Falha { nome } => por_provedor.entry(nome).or_default().falhas += 1,
+            Evento::Falha { nome, categoria } => {
+                let m = por_provedor.entry(nome).or_default();
+                m.falhas += 1;
+                *m.falhas_por_categoria.entry(categoria).or_insert(0) += 1;
+            }
             Evento::Pulo { nome } => por_provedor.entry(nome).or_default().pulos += 1,
             Evento::ProblemaConfig { nome } => {
                 por_provedor.entry(nome).or_default().problemas_config += 1
@@ -639,6 +754,7 @@ fn classificar(corpo: &str) -> Option<Evento> {
     if let Some(resto) = corpo.strip_prefix("[falha] ") {
         return Some(Evento::Falha {
             nome: nome_antes_dos_dois_pontos(resto)?,
+            categoria: categorizar_falha(resto),
         });
     }
     if let Some(resto) = corpo.strip_prefix("[pula] ") {
@@ -696,6 +812,55 @@ fn nome_antes_dos_dois_pontos(corpo: &str) -> Option<String> {
     } else {
         Some(nome.to_string())
     }
+}
+
+/// Deduz a [`CategoriaFalha`] do corpo de um `[falha] <nome>: <motivo> (após ...)`.
+///
+/// Isola o `<motivo>` (tudo após o PRIMEIRO `:`, que separa o nome do provedor) e o classifica.
+/// O `<motivo>` é o [`Display`](std::fmt::Display) de uma
+/// [`FalhaProvedor`](crate::erro::FalhaProvedor): `http <status>: ...`, `rede: ...`,
+/// `processo: ...`, `indisponível: ...`, `resposta vazia`/`resposta inválida: ...`.
+fn categorizar_falha(corpo_apos_falha: &str) -> CategoriaFalha {
+    match corpo_apos_falha.split_once(':') {
+        Some((_nome, motivo)) => categorizar_motivo(motivo.trim()),
+        // Sem `:` não há motivo estruturado (formato inesperado) — cai em "outra".
+        None => CategoriaFalha::Outra,
+    }
+}
+
+/// Classifica o texto do motivo (já sem o nome do provedor) em uma [`CategoriaFalha`].
+/// Espelha, do lado da leitura, a mesma taxonomia que [`crate::erro::FalhaProvedor`] grava.
+fn categorizar_motivo(motivo: &str) -> CategoriaFalha {
+    if let Some(resto) = motivo.strip_prefix("http ") {
+        // Os dígitos logo após "http " são o status; sem dígitos, cai em "outra" (status 0).
+        let status: u16 = resto
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        return match status {
+            401 | 403 => CategoriaFalha::Autenticacao,
+            429 => CategoriaFalha::LimiteTaxa,
+            408 => CategoriaFalha::ServidorInstavel,
+            400 | 404 | 413 | 422 => CategoriaFalha::RequisicaoInvalida,
+            s if (500..=599).contains(&s) => CategoriaFalha::ServidorInstavel,
+            _ => CategoriaFalha::Outra,
+        };
+    }
+    if motivo.starts_with("rede") {
+        return CategoriaFalha::Rede;
+    }
+    if motivo.starts_with("processo") {
+        return CategoriaFalha::Processo;
+    }
+    if motivo.starts_with("indisponível") {
+        return CategoriaFalha::Configuracao;
+    }
+    if motivo.starts_with("resposta vazia") || motivo.starts_with("resposta inválida") {
+        return CategoriaFalha::RespostaRuim;
+    }
+    CategoriaFalha::Outra
 }
 
 /// Pega o nome até a próxima aspa simples, dado um texto que COMEÇA logo após a aspa de
@@ -772,8 +937,24 @@ impl std::fmt::Display for Relatorio {
                 "- {nome}: {} ok, {} falha, {} pulo, {} cfg{disjuntor}{retentativas} | {latencia}",
                 m.sucessos, m.falhas, m.pulos, m.problemas_config
             )?;
+            // Abre o "por quê" das falhas deste provedor (auth/timeout/rede...) — o sinal mais
+            // acionável. Só aparece quando houve falha, para não poluir a linha no caso limpo.
+            if m.falhas > 0 {
+                writeln!(f, "    ↳ falhas por motivo: {}", m.resumo_falhas())?;
+            }
         }
         writeln!(f, "total de roteamentos: {total}")?;
+        // Agregado das falhas por motivo (todos os provedores) — "de que a cadeia morreu no
+        // período". Só aparece se houve alguma falha.
+        let falhas_agregadas = self.falhas_por_categoria_total();
+        if !falhas_agregadas.is_empty() {
+            let resumo = falhas_agregadas
+                .iter()
+                .map(|(cat, n)| format!("{} {n}", cat.rotulo()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(f, "falhas por motivo (total): {resumo}")?;
+        }
         // Economia do disjuntor: só reporta se ele chegou a pular alguém no período.
         let pulos_disjuntor = self.total_pulos_disjuntor();
         if pulos_disjuntor > 0 {
@@ -871,7 +1052,7 @@ mod testes {
     fn classifica_falha_pula_e_config() {
         assert!(matches!(
             classificar("[falha] claude: 401 não autorizado (após 90ms) — caindo pro próximo"),
-            Some(Evento::Falha { nome }) if nome == "claude"
+            Some(Evento::Falha { nome, .. }) if nome == "claude"
         ));
         assert!(matches!(
             classificar("[pula] groq: desabilitado ou sem chave"),
@@ -887,6 +1068,125 @@ mod testes {
             classificar("[retentativa] groq: rede: piscou — retentando (1 de 2) após 250ms"),
             Some(Evento::Retentativa { nome }) if nome == "groq"
         ));
+    }
+
+    #[test]
+    fn categoriza_motivo_de_cada_tipo_de_falha() {
+        // HTTP mapeado por status (usa o Display real da FalhaProvedor: "http <status>: ...").
+        assert_eq!(
+            categorizar_motivo("http 401: não autorizado"),
+            CategoriaFalha::Autenticacao
+        );
+        assert_eq!(
+            categorizar_motivo("http 403: proibido"),
+            CategoriaFalha::Autenticacao
+        );
+        assert_eq!(
+            categorizar_motivo("http 429: rate limit"),
+            CategoriaFalha::LimiteTaxa
+        );
+        assert_eq!(
+            categorizar_motivo("http 503: indisponível"),
+            CategoriaFalha::ServidorInstavel
+        );
+        assert_eq!(
+            categorizar_motivo("http 408: timeout"),
+            CategoriaFalha::ServidorInstavel
+        );
+        assert_eq!(
+            categorizar_motivo("http 400: pedido ruim"),
+            CategoriaFalha::RequisicaoInvalida
+        );
+        // Não-HTTP: rede, processo, config e resposta ruim.
+        assert_eq!(
+            categorizar_motivo("rede: conexão recusada"),
+            CategoriaFalha::Rede
+        );
+        assert_eq!(
+            categorizar_motivo("processo: código de saída 1"),
+            CategoriaFalha::Processo
+        );
+        assert_eq!(
+            categorizar_motivo("indisponível: sem chave"),
+            CategoriaFalha::Configuracao
+        );
+        assert_eq!(
+            categorizar_motivo("resposta vazia"),
+            CategoriaFalha::RespostaRuim
+        );
+        assert_eq!(
+            categorizar_motivo("resposta inválida: json sem campo"),
+            CategoriaFalha::RespostaRuim
+        );
+        // Status esquisito e texto desconhecido caem em "outra" (nunca deveriam dominar).
+        assert_eq!(
+            categorizar_motivo("http 418: bule de chá"),
+            CategoriaFalha::Outra
+        );
+        assert_eq!(
+            categorizar_motivo("algo que não conheço"),
+            CategoriaFalha::Outra
+        );
+    }
+
+    #[test]
+    fn falha_leva_a_categoria_no_evento_e_no_relatorio() {
+        // A linha `[falha]` completa deve virar Evento::Falha COM a categoria certa.
+        match classificar("[falha] gemini: http 429: cota (após 120ms) — caindo pro próximo") {
+            Some(Evento::Falha { nome, categoria }) => {
+                assert_eq!(nome, "gemini");
+                assert_eq!(categoria, CategoriaFalha::LimiteTaxa);
+            }
+            _ => panic!("esperava Evento::Falha com categoria"),
+        }
+
+        // Agregando um log inteiro: o Claude falha por auth 2x e por timeout 1x; o resumo
+        // por provedor e o agregado total devem refletir o "por quê".
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [falha] claude: http 401: token caiu (após 90ms) — caindo pro próximo
+2026-06-30 12:00:01 UTC [roteador] [falha] claude: http 401: token caiu (após 90ms) — caindo pro próximo
+2026-06-30 12:00:02 UTC [roteador] [falha] claude: http 503: instável (após 90ms) — caindo pro próximo
+2026-06-30 12:00:03 UTC [roteador] [ok] respondido por 'ollama_local' em 33ms
+";
+        let r = agregar(log);
+        let claude = &r.por_provedor["claude"];
+        assert_eq!(claude.falhas, 3);
+        assert_eq!(
+            claude.falhas_por_categoria[&CategoriaFalha::Autenticacao],
+            2
+        );
+        assert_eq!(
+            claude.falhas_por_categoria[&CategoriaFalha::ServidorInstavel],
+            1
+        );
+        // A soma das categorias tem que bater com o total de falhas (invariante).
+        let soma: u64 = claude.falhas_por_categoria.values().sum();
+        assert_eq!(soma, claude.falhas);
+        // Resumo em texto, na ordem do enum (Autenticacao vem antes de ServidorInstavel).
+        assert_eq!(claude.resumo_falhas(), "auth 2, timeout/5xx 1");
+        // Agregado total (só o claude falhou aqui).
+        let total = r.falhas_por_categoria_total();
+        assert_eq!(total[&CategoriaFalha::Autenticacao], 2);
+        assert_eq!(total[&CategoriaFalha::ServidorInstavel], 1);
+    }
+
+    #[test]
+    fn json_traz_falhas_por_categoria() {
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [falha] claude: http 401: x (após 90ms) — caindo pro próximo
+2026-06-30 12:00:01 UTC [roteador] [ok] respondido por 'ollama_local' em 33ms
+";
+        let r = agregar(log);
+        let json = r.para_json(&BTreeMap::new()).para_texto();
+        // Topo e por-provedor devem citar a categoria com a CHAVE estável (snake_case).
+        assert!(
+            json.contains("\"falhas_por_categoria\""),
+            "faltou o campo no JSON: {json}"
+        );
+        assert!(
+            json.contains("\"autenticacao\":1"),
+            "faltou a contagem de auth no JSON: {json}"
+        );
     }
 
     #[test]
