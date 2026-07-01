@@ -43,7 +43,7 @@ e citar o nome na `ordem_fallback`.
 | Módulo          | Papel                                                            |
 |-----------------|-----------------------------------------------------------------|
 | `json.rs`       | JSON próprio (parse + encode), com testes                       |
-| `http.rs`       | HTTP/1.1 cru sobre TcpStream (sem TLS), com timeouts            |
+| `http.rs`       | HTTP/1.1 cru sobre TcpStream (sem TLS), com timeouts + decodifica `chunked` |
 | `https.rs`      | HTTPS via `curl` (binário externo), espelha a interface do http |
 | `prompt.rs`     | Monta prompt/mensagens a partir de (mensagem, contexto)         |
 | `erro.rs`       | Erros tipados: `FalhaProvedor`, `ErroRoteador`                  |
@@ -96,6 +96,21 @@ escondido: os testes apontam para um arquivo temporário e o roteamento fica **h
 — antes, rodar `cargo test` gravava linhas de teste (portas mortas) no log de produção e
 **contaminava as métricas** do `bin/metricas` (a medida de "% no piso", que é o objetivo
 do projeto). Produção não precisa declará-lo.
+
+## Cliente HTTP: leitura de resposta `chunked`
+
+O `http.rs` fala HTTP/1.1 cru (para o Ollama local, sem TLS). Um servidor HTTP/1.1 pode
+enviar o corpo em **`Transfer-Encoding: chunked`** — a resposta chega em pedaços, cada um
+precedido pelo seu tamanho em hexadecimal, terminando num pedaço de tamanho 0. Ler o corpo
+"cru" nesse caso deixaria a **moldura dos chunks** (linhas de tamanho + terminadores)
+misturada aos dados: o JSON do Ollama sairia sujo e o parser falharia — o **piso apareceria
+"quebrado" mesmo respondendo**, jogando o robô para a resposta de cortesia à toa.
+
+Por isso o `interpretar_resposta` detecta o cabeçalho (sem diferenciar maiúsculas, aceitando
+codificação composta como `gzip, chunked`) e **decodifica os chunks**, devolvendo só os dados
+remontados. Chunk truncado/malformado vira `FalhaProvedor::Rede` — nunca um corpo pela metade
+em silêncio. Hoje o Ollama responde com `Content-Length` (caminho idêntico ao de antes); esta
+é uma rede de segurança para versões/servidores que usem `chunked`.
 
 ## Piso de última instância: provedor `resposta_fixa`
 

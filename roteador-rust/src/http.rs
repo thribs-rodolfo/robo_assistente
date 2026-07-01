@@ -138,9 +138,88 @@ fn interpretar_resposta(bruto: &[u8]) -> Result<RespostaHttp, FalhaProvedor> {
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| FalhaProvedor::Rede(format!("status HTTP ilegível: '{primeira_linha}'")))?;
 
+    // Corpo cru = tudo após a linha em branco. Se o servidor usar `Transfer-Encoding:
+    // chunked` (HTTP/1.1 pode fazer isso mesmo com `Connection: close`), esse trecho vem
+    // com a MOLDURA dos chunks (linhas de tamanho em hex + terminadores) misturada aos
+    // dados. Sem desfazer essa moldura, o JSON do Ollama sairia sujo e o parser falharia —
+    // o piso (Ollama) apareceria "quebrado" mesmo respondendo. Por isso decodificamos.
+    let corpo_bruto = &bruto[posicao_corpo..];
+    let corpo_bytes = if cabecalho_indica_chunked(cabecalhos) {
+        decodificar_chunked(corpo_bruto)?
+    } else {
+        corpo_bruto.to_vec()
+    };
+
     // O corpo pode vir em UTF-8; usamos lossy para nunca quebrar por um byte estranho.
-    let corpo = String::from_utf8_lossy(&bruto[posicao_corpo..]).into_owned();
+    let corpo = String::from_utf8_lossy(&corpo_bytes).into_owned();
     Ok(RespostaHttp { status, corpo })
+}
+
+/// Diz se os cabeçalhos anunciam `Transfer-Encoding: chunked` (comparação sem diferenciar
+/// maiúsculas, como manda o HTTP). Um valor pode listar mais de uma codificação
+/// (ex.: `gzip, chunked`); basta o `chunked` aparecer para o corpo vir em chunks.
+fn cabecalho_indica_chunked(cabecalhos: &str) -> bool {
+    cabecalhos.lines().any(|linha| match linha.split_once(':') {
+        Some((nome, valor)) => {
+            nome.trim().eq_ignore_ascii_case("transfer-encoding")
+                && valor.to_ascii_lowercase().contains("chunked")
+        }
+        None => false,
+    })
+}
+
+/// Desfaz a codificação `chunked`: o corpo vem como uma sequência de pedaços, cada um
+/// precedido pelo seu tamanho em HEXADECIMAL numa linha própria, e termina num pedaço de
+/// tamanho 0. Formato de cada pedaço:
+///
+/// ```text
+/// <tamanho-em-hex>[;extensão]\r\n
+/// <tamanho bytes de dados>\r\n
+/// ```
+///
+/// Devolvemos só os DADOS concatenados (sem a moldura). Qualquer inconsistência vira
+/// `FalhaProvedor::Rede` — nunca um corpo pela metade em silêncio.
+fn decodificar_chunked(corpo: &[u8]) -> Result<Vec<u8>, FalhaProvedor> {
+    let mut saida = Vec::new();
+    let mut i = 0;
+    loop {
+        // 1) Lê a linha de tamanho, até o próximo \r\n.
+        let fim_linha = encontrar_subsequencia(&corpo[i..], b"\r\n")
+            .ok_or_else(|| FalhaProvedor::Rede("chunk sem CRLF após o tamanho".into()))?;
+        let linha_tamanho = &corpo[i..i + fim_linha];
+        i += fim_linha + 2; // pula a linha do tamanho e o \r\n
+
+        // O tamanho pode trazer uma extensão após ';' (ex.: "1a;algo=x"); ignoramos a extensão.
+        let hex = match encontrar_subsequencia(linha_tamanho, b";") {
+            Some(pos) => &linha_tamanho[..pos],
+            None => linha_tamanho,
+        };
+        let hex = std::str::from_utf8(hex)
+            .map_err(|_| FalhaProvedor::Rede("tamanho de chunk não-UTF8".into()))?
+            .trim();
+        let tamanho = usize::from_str_radix(hex, 16)
+            .map_err(|_| FalhaProvedor::Rede(format!("tamanho de chunk inválido: '{hex}'")))?;
+
+        // 2) Tamanho 0 marca o fim (podem vir trailers depois, que não nos interessam).
+        if tamanho == 0 {
+            break;
+        }
+
+        // 3) Copia os `tamanho` bytes de dados.
+        let fim_dados = i
+            .checked_add(tamanho)
+            .filter(|&fim| fim <= corpo.len())
+            .ok_or_else(|| FalhaProvedor::Rede("chunk truncado (dados além do corpo)".into()))?;
+        saida.extend_from_slice(&corpo[i..fim_dados]);
+        i = fim_dados;
+
+        // 4) Cada bloco de dados é seguido de um \r\n de fechamento; pula-o.
+        if corpo.get(i..i + 2) != Some(b"\r\n") {
+            return Err(FalhaProvedor::Rede("chunk sem CRLF de fechamento".into()));
+        }
+        i += 2;
+    }
+    Ok(saida)
 }
 
 /// Procura uma subsequência de bytes (ex.: o separador \r\n\r\n) e devolve onde começa.
@@ -223,5 +302,53 @@ mod testes {
     fn acha_subsequencia() {
         assert_eq!(encontrar_subsequencia(b"aXYb", b"XY"), Some(1));
         assert_eq!(encontrar_subsequencia(b"abc", b"XY"), None);
+    }
+
+    #[test]
+    fn detecta_cabecalho_chunked_sem_diferenciar_maiuscula() {
+        assert!(cabecalho_indica_chunked(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        ));
+        // Nome/valor em caixas variadas e codificação composta ainda contam.
+        assert!(cabecalho_indica_chunked(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, Chunked\r\n\r\n"
+        ));
+        // Sem o cabeçalho, não é chunked.
+        assert!(!cabecalho_indica_chunked(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn interpreta_resposta_chunked() {
+        // Dois pedaços ("Paris" + ".") + o pedaço final de tamanho 0. O corpo remontado
+        // deve sair SEM a moldura dos chunks — exatamente o JSON/texto original.
+        let bruto = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nParis\r\n1\r\n.\r\n0\r\n\r\n";
+        let resposta = interpretar_resposta(bruto).unwrap();
+        assert_eq!(resposta.status, 200);
+        assert_eq!(resposta.corpo, "Paris.");
+    }
+
+    #[test]
+    fn chunked_com_json_do_ollama_remonta_o_corpo() {
+        // Caso realista: o corpo JSON do Ollama chegando em chunks deve remontar íntegro
+        // para o parser conseguir extrair o campo "response".
+        let bruto = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n{\"response\":\r\n5\r\n\"oi\"}\r\n0\r\n\r\n";
+        let resposta = interpretar_resposta(bruto).unwrap();
+        assert_eq!(resposta.corpo, "{\"response\":\"oi\"}");
+    }
+
+    #[test]
+    fn decodifica_chunk_ignorando_extensao() {
+        // "5;algo=x" — a extensão após ';' deve ser ignorada, lendo só o tamanho 5.
+        let corpo = b"5;algo=x\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(decodificar_chunked(corpo).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn chunked_truncado_vira_erro_nao_corpo_pela_metade() {
+        // Anuncia 10 bytes mas só entrega 5: erro tipado, nunca um corpo silenciosamente cortado.
+        let corpo = b"a\r\nhello\r\n0\r\n\r\n";
+        assert!(decodificar_chunked(corpo).is_err());
     }
 }
