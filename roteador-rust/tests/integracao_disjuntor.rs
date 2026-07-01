@@ -59,6 +59,7 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
             habilitado: true,
             limiar_falhas: 2,
             cooldown_segundos: 3_600,
+            cooldown_maximo_segundos: 86_400,
             caminho_estado: caminho_estado.clone(),
         },
         // Telemetria para arquivo temporário: não suja o log de produção (fonte das métricas).

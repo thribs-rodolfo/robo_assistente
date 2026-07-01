@@ -54,7 +54,14 @@ pub struct ConfigDisjuntor {
     /// Quantas falhas SEGUIDAS abrem o circuito de um provedor.
     pub limiar_falhas: u32,
     /// Por quantos segundos o circuito fica aberto (provedor pulado) antes do meio-aberto.
+    /// Este é o cooldown BASE: a cada reabertura seguida (meio-aberto que falha de novo),
+    /// o intervalo real DOBRA — backoff exponencial — até `cooldown_maximo_segundos`.
     pub cooldown_segundos: u64,
+    /// Teto do backoff exponencial: por mais que um provedor insista em falhar, o circuito
+    /// nunca fica aberto além disto. Evita dois extremos ruins: sondar um provedor morto a
+    /// cada `cooldown_segundos` fixo (desperdício) e ficar aberto "para sempre" (nunca
+    /// reavaliar se ele voltou). Se vier menor que `cooldown_segundos`, o base vira o piso.
+    pub cooldown_maximo_segundos: u64,
     /// Onde persistir o estado entre mensagens (a ponte é um processo vivo, mas o binário
     /// pode reiniciar; o arquivo dá continuidade). Fora do repositório.
     pub caminho_estado: String,
@@ -65,11 +72,13 @@ pub const CAMINHO_ESTADO_DISJUNTOR_PADRAO: &str = "/var/log/roteador-disjuntor.e
 
 impl Default for ConfigDisjuntor {
     fn default() -> Self {
-        // Padrões conservadores: desligado, e — quando ligado — 3 falhas abrem por 60s.
+        // Padrões conservadores: desligado, e — quando ligado — 3 falhas abrem por 60s,
+        // com o backoff dobrando até um teto de 30 min (60→120→240→…→1800s).
         ConfigDisjuntor {
             habilitado: false,
             limiar_falhas: 3,
             cooldown_segundos: 60,
+            cooldown_maximo_segundos: 1_800,
             caminho_estado: CAMINHO_ESTADO_DISJUNTOR_PADRAO.to_string(),
         }
     }
@@ -174,6 +183,12 @@ fn interpretar_disjuntor(valor: Option<&Valor>) -> ConfigDisjuntor {
         .and_then(Valor::como_numero)
         .map(|n| (n.max(1.0)) as u64)
         .unwrap_or(padrao.cooldown_segundos);
+    // Teto do backoff: mínimo 1s (o uso, em disjuntor.rs, ainda garante teto >= base).
+    let cooldown_maximo_segundos = valor
+        .obter("cooldown_maximo_segundos")
+        .and_then(Valor::como_numero)
+        .map(|n| (n.max(1.0)) as u64)
+        .unwrap_or(padrao.cooldown_maximo_segundos);
     let caminho_estado = valor
         .obter("caminho_estado")
         .and_then(Valor::como_texto)
@@ -184,6 +199,7 @@ fn interpretar_disjuntor(valor: Option<&Valor>) -> ConfigDisjuntor {
         habilitado,
         limiar_falhas,
         cooldown_segundos,
+        cooldown_maximo_segundos,
         caminho_estado,
     }
 }
@@ -277,12 +293,13 @@ mod testes {
             "ordem_fallback":["g"],
             "provedores":{"g":{"tipo":"ollama"}},
             "disjuntor":{"habilitado":true,"limiar_falhas":5,"cooldown_segundos":120,
-                         "caminho_estado":"/tmp/x.estado"}
+                         "cooldown_maximo_segundos":3600,"caminho_estado":"/tmp/x.estado"}
         }"#;
         let config = interpretar(bruto).unwrap();
         assert!(config.disjuntor.habilitado);
         assert_eq!(config.disjuntor.limiar_falhas, 5);
         assert_eq!(config.disjuntor.cooldown_segundos, 120);
+        assert_eq!(config.disjuntor.cooldown_maximo_segundos, 3600);
         assert_eq!(config.disjuntor.caminho_estado, "/tmp/x.estado");
     }
 
@@ -294,6 +311,7 @@ mod testes {
         assert!(config.disjuntor.habilitado);
         assert_eq!(config.disjuntor.limiar_falhas, 3);
         assert_eq!(config.disjuntor.cooldown_segundos, 60);
+        assert_eq!(config.disjuntor.cooldown_maximo_segundos, 1_800);
     }
 
     #[test]

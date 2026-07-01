@@ -273,6 +273,7 @@ mod testes {
             habilitado: true,
             limiar_falhas: 3,
             cooldown_segundos: 100_000,
+            cooldown_maximo_segundos: 1_000_000,
             caminho_estado: caminho.clone(),
         };
         // Ancoramos as falhas no AGORA real (o `rotear` usa o relógio real), senão o

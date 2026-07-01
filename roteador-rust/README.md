@@ -79,7 +79,8 @@ Mora **fora do repositório**, com as chaves reais, em
     "ollama_local": {"tipo": "ollama", "url_base": "http://127.0.0.1:11434",
                      "modelo": "qwen2.5:1.5b", "timeout_segundos": 180, "habilitado": true}
   },
-  "disjuntor": {"habilitado": false, "limiar_falhas": 3, "cooldown_segundos": 60}
+  "disjuntor": {"habilitado": false, "limiar_falhas": 3, "cooldown_segundos": 60,
+                "cooldown_maximo_segundos": 1800}
 }
 ```
 
@@ -103,6 +104,13 @@ inteiro antes de cair pro Ollama — lentidão à toa, mensagem após mensagem.
 — nesse intervalo o roteador o **pula** sem gastar rede/processo. Passado o cooldown, deixa
 passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabre.
 
+- **Backoff exponencial no cooldown.** A primeira abertura espera `cooldown_segundos`; cada
+  reabertura seguida (meio-aberto que falha de novo) **dobra** o intervalo — `60 → 120 → 240
+  → …` — até o teto `cooldown_maximo_segundos`. Assim um provedor que volta rápido sofre
+  pouca espera, mas um que fica fora por horas (token do Claude caído) para de ser sondado a
+  cada minuto: menos latência gasta com provedor morto, sem nunca esquecê-lo (o teto garante
+  que ele volta a ser testado). Um sucesso zera o contador e a próxima rajada recomeça no base.
+
 - **O piso (Ollama local, último da ordem) NUNCA é pulado** → o robô nunca fica mudo.
 - **Só falhas de INDISPONIBILIDADE abrem o circuito.** Nem toda falha significa "provedor
   fora". O roteador classifica (ver `FalhaProvedor::indica_provedor_indisponivel`):
@@ -123,7 +131,8 @@ passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabr
   falhas seguidas) — pulando`.
 
 Campos (todos opcionais, com padrão): `habilitado` (false), `limiar_falhas` (3),
-`cooldown_segundos` (60), `caminho_estado` (`/var/log/roteador-disjuntor.estado`).
+`cooldown_segundos` (60, cooldown BASE), `cooldown_maximo_segundos` (1800, teto do backoff),
+`caminho_estado` (`/var/log/roteador-disjuntor.estado`).
 
 ## Uso
 

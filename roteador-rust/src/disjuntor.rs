@@ -75,14 +75,16 @@ impl EstadoDisjuntor {
     /// Registra uma FALHA real (o provedor foi tentado e o `responder` deu erro).
     ///
     /// Incrementa o contador de falhas seguidas; se cruzar `limiar_falhas`, abre o circuito
-    /// por `cooldown` a partir de `agora`. Note que, no "meio-aberto", o contador já está
-    /// em/above do limiar — então uma única falha reabre imediatamente. É o comportamento
-    /// desejado: se acabou de falhar de novo, não vale a pena insistir já.
+    /// a partir de `agora` por um cooldown com BACKOFF EXPONENCIAL (ver [`cooldown_com_backoff`]).
+    /// Note que, no "meio-aberto", o contador já está em/acima do limiar — então uma única
+    /// falha reabre imediatamente, e cada reabertura seguida fica MAIS longa (dobra até o teto):
+    /// um provedor morto há horas deixa de ser sondado toda hora, sem nunca ser esquecido.
     pub fn apos_falha(&mut self, nome: &str, agora: u64, config: &ConfigDisjuntor) {
         let estado = self.por_provedor.entry(nome.to_string()).or_default();
         estado.falhas_consecutivas = estado.falhas_consecutivas.saturating_add(1);
         if estado.falhas_consecutivas >= config.limiar_falhas {
-            estado.aberto_ate = agora.saturating_add(config.cooldown_segundos);
+            let cooldown = cooldown_com_backoff(estado.falhas_consecutivas, config);
+            estado.aberto_ate = agora.saturating_add(cooldown);
         }
     }
 
@@ -188,16 +190,43 @@ impl EstadoDisjuntor {
     }
 }
 
+/// Calcula por quantos segundos o circuito deve ficar aberto, dado o total de falhas
+/// seguidas — cooldown BASE com backoff exponencial, limitado por um teto.
+///
+/// A ideia: a PRIMEIRA abertura (falhas == limiar) usa o cooldown base; cada falha SEGUINTE
+/// (reabertura no meio-aberto) DOBRA o intervalo — base, 2×base, 4×base… — até `cooldown_maximo`.
+/// Assim um provedor que volta rápido sofre pouca espera, mas um que insiste em falhar (token
+/// do Claude caído há horas) para de ser sondado a cada cooldown fixo, economizando latência.
+///
+/// Função PURA (só faz conta sobre os números) → testável sem relógio/disco/rede. Tudo com
+/// aritmética saturante e teto: nunca estoura `u64`, nunca fica aberto "para sempre". Se o teto
+/// vier menor que o base (config estranha), o base vira o piso — nunca devolvemos menos que ele.
+pub fn cooldown_com_backoff(falhas_consecutivas: u32, config: &ConfigDisjuntor) -> u64 {
+    // Quantas falhas ALÉM do limiar já houve. 0 na primeira abertura, 1 na primeira reabertura…
+    // Limitamos o expoente a 32: 2^32 já satura qualquer cooldown real, e evita expoente absurdo.
+    let excedente = falhas_consecutivas
+        .saturating_sub(config.limiar_falhas)
+        .min(32);
+    let fator = 2u64.saturating_pow(excedente);
+    let com_backoff = config.cooldown_segundos.saturating_mul(fator);
+    // O teto nunca pode ser menor que o base (defesa contra config invertida).
+    let teto = config
+        .cooldown_maximo_segundos
+        .max(config.cooldown_segundos);
+    com_backoff.min(teto)
+}
+
 #[cfg(test)]
 mod testes {
     use super::*;
 
-    /// Config de teste: abre com 3 falhas, cooldown de 60s.
+    /// Config de teste: abre com 3 falhas, cooldown base 60s, teto 600s.
     fn config_teste() -> ConfigDisjuntor {
         ConfigDisjuntor {
             habilitado: true,
             limiar_falhas: 3,
             cooldown_segundos: 60,
+            cooldown_maximo_segundos: 600,
             caminho_estado: "/tmp/nao-usado.estado".into(),
         }
     }
@@ -318,5 +347,71 @@ mod testes {
         assert!(carregado.esta_aberto("claude", 5));
 
         let _ = std::fs::remove_file(&caminho);
+    }
+
+    #[test]
+    fn cooldown_backoff_dobra_a_cada_falha_ate_o_teto() {
+        let cfg = config_teste(); // base 60, limiar 3, teto 600
+                                  // Antes do limiar não abriria; a função é consultada só a partir do limiar.
+        assert_eq!(cooldown_com_backoff(3, &cfg), 60); // 1ª abertura: base
+        assert_eq!(cooldown_com_backoff(4, &cfg), 120); // reabertura: 2×
+        assert_eq!(cooldown_com_backoff(5, &cfg), 240); // 4×
+        assert_eq!(cooldown_com_backoff(6, &cfg), 480); // 8×
+        assert_eq!(cooldown_com_backoff(7, &cfg), 600); // 16×=960 -> capado no teto 600
+        assert_eq!(cooldown_com_backoff(50, &cfg), 600); // muito acima: segue no teto
+    }
+
+    #[test]
+    fn cooldown_backoff_com_teto_menor_que_base_usa_o_base_como_piso() {
+        // Config "invertida" (teto < base): não devolve menos que o base — degrada com graça.
+        let cfg = ConfigDisjuntor {
+            cooldown_segundos: 100,
+            cooldown_maximo_segundos: 10,
+            ..config_teste()
+        };
+        assert_eq!(cooldown_com_backoff(3, &cfg), 100);
+        assert_eq!(cooldown_com_backoff(9, &cfg), 100);
+    }
+
+    #[test]
+    fn apos_falha_aplica_backoff_crescente_na_reabertura() {
+        let cfg = config_teste(); // base 60, limiar 3, teto 600
+        let mut estado = EstadoDisjuntor::vazio();
+
+        // Três falhas em t=0,0,0 abrem pela 1ª vez: base 60 -> aberto até 60.
+        for _ in 0..3 {
+            estado.apos_falha("claude", 0, &cfg);
+        }
+        assert!(estado.esta_aberto("claude", 59));
+        assert!(!estado.esta_aberto("claude", 60)); // meio-aberto
+
+        // Falha no meio-aberto (t=60): 4ª falha -> backoff 2× = 120 -> aberto até 180.
+        estado.apos_falha("claude", 60, &cfg);
+        assert!(estado.esta_aberto("claude", 179));
+        assert!(!estado.esta_aberto("claude", 180));
+
+        // Nova falha no meio-aberto (t=180): 5ª falha -> 4× = 240 -> aberto até 420.
+        estado.apos_falha("claude", 180, &cfg);
+        assert!(estado.esta_aberto("claude", 419));
+        assert!(!estado.esta_aberto("claude", 420));
+    }
+
+    #[test]
+    fn sucesso_zera_o_backoff() {
+        // Depois de um sucesso, o contador some e a próxima rajada recomeça no cooldown base.
+        let cfg = config_teste();
+        let mut estado = EstadoDisjuntor::vazio();
+        for _ in 0..5 {
+            estado.apos_falha("claude", 0, &cfg); // já subiu o backoff
+        }
+        estado.apos_sucesso("claude");
+        assert_eq!(estado.falhas_de("claude"), 0);
+
+        // Nova rajada: volta ao base 60 (não continua do backoff alto anterior).
+        for _ in 0..3 {
+            estado.apos_falha("claude", 1_000, &cfg);
+        }
+        assert!(estado.esta_aberto("claude", 1_059));
+        assert!(!estado.esta_aberto("claude", 1_060));
     }
 }
