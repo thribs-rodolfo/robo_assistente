@@ -392,6 +392,63 @@ impl Relatorio {
         Some(texto)
     }
 
+    /// Custo estimado por provedor pelo VOLUME da troca, dado uma `tabela` de preços
+    /// (provedor -> custo por MIL tokens estimados, na unidade que o operador escolher).
+    /// Para cada provedor multiplica `tokens_estimados()` (≈ `chars/4`) pelo preço e divide
+    /// por mil. Quem não está na `tabela` entra com custo 0 (ex.: o piso Ollama, local e grátis).
+    ///
+    /// Por que existe, além do [`custo_por_provedor`](Relatorio::custo_por_provedor)?
+    /// Aquele cobra o MESMO por resposta, ignorando o tamanho de cada troca — uma resposta de
+    /// duas palavras custa igual a uma de duas páginas. Este usa o volume que a telemetria já
+    /// registra (entrada + resposta) e fica MAIS PERTO da forma como os provedores de verdade
+    /// cobram (por token). Os dois são ORTOGONAIS: o operador liga o que fizer sentido.
+    ///
+    /// Limitação honesta (código educacional): os tokens são ESTIMADOS por `chars/4`, não a
+    /// contagem real do tokenizador do provedor; e o volume é o da TROCA (mensagem + resposta),
+    /// sem o sistema/histórico que o provedor monta por dentro. É aproximação de custo, não fatura.
+    pub fn custo_por_provedor_por_token(
+        &self,
+        tabela: &BTreeMap<String, f64>,
+    ) -> BTreeMap<String, f64> {
+        self.por_provedor
+            .iter()
+            .map(|(nome, m)| {
+                let preco_por_mil = tabela.get(nome).copied().unwrap_or(0.0);
+                let custo = m.tokens_estimados() as f64 * preco_por_mil / 1000.0;
+                (nome.clone(), custo)
+            })
+            .collect()
+    }
+
+    /// Custo estimado total por token no período = soma do custo por token de todos os provedores.
+    pub fn custo_total_por_token(&self, tabela: &BTreeMap<String, f64>) -> f64 {
+        self.custo_por_provedor_por_token(tabela).values().sum()
+    }
+
+    /// Bloco de texto com o custo estimado por token por provedor e o total, ou `None` quando a
+    /// `tabela` de preços por mil tokens está vazia (sem `--custo-por-mil-tokens`, não imprime nada).
+    /// Fica fora do [`Display`](std::fmt::Display) por depender de um parâmetro externo, igual a
+    /// [`Relatorio::secao_custo`].
+    pub fn secao_custo_por_token(&self, tabela: &BTreeMap<String, f64>) -> Option<String> {
+        if tabela.is_empty() {
+            return None;
+        }
+        let mut texto = String::from("-- custo estimado (por mil tokens ~chars/4) --\n");
+        for (nome, custo) in self.custo_por_provedor_por_token(tabela) {
+            let origem = if tabela.contains_key(&nome) {
+                ""
+            } else {
+                " (sem preço → 0)"
+            };
+            texto.push_str(&format!("- {nome}: {custo:.2}{origem}\n"));
+        }
+        texto.push_str(&format!(
+            "custo total estimado (por token): {:.2}\n",
+            self.custo_total_por_token(tabela)
+        ));
+        Some(texto)
+    }
+
     /// Instante (epoch UTC) do último sucesso de QUALQUER provedor bom (fora do piso), ou
     /// `None` se nenhum provedor bom respondeu no período (ou só em linhas sem timestamp).
     /// É o marco a partir do qual medimos "há quanto tempo o robô está sem provedor bom".
@@ -458,13 +515,20 @@ impl Relatorio {
     /// informação que o [`Display`](std::fmt::Display) mostra ao humano, mas legível por
     /// máquina (dashboard, alerta externo, outro programa que consome o log).
     ///
-    /// A `tabela` de preços é opcional, igual ao relatório de texto: quando vazia, o bloco
-    /// `custo` simplesmente não aparece (espelha o comportamento de rodar sem `--custo`).
+    /// As `tabela`s de preços são opcionais, igual ao relatório de texto: quando vazias, o
+    /// bloco correspondente simplesmente não aparece. `tabela_resposta` é o custo por resposta
+    /// (do `--custo`); `tabela_por_token` é o custo por mil tokens estimados (do
+    /// `--custo-por-mil-tokens`). Os dois blocos são independentes: cada um só entra se houver
+    /// preço para ele.
     ///
     /// Função PURA: monta um `Valor` a partir do que já está no relatório — não lê disco,
     /// não dispara provedor nenhum (portanto jamais toca o Claude). Latências que não
     /// existem (provedor que nunca respondeu) viram `null`, não `0` — `0ms` seria mentira.
-    pub fn para_json(&self, tabela: &BTreeMap<String, f64>) -> crate::json::Valor {
+    pub fn para_json(
+        &self,
+        tabela_resposta: &BTreeMap<String, f64>,
+        tabela_por_token: &BTreeMap<String, f64>,
+    ) -> crate::json::Valor {
         use crate::json::Valor;
 
         // Option<u128> -> Valor: número quando há amostra, `null` quando o provedor nunca
@@ -628,18 +692,39 @@ impl Relatorio {
             ("provedores".into(), Valor::Objeto(provedores)),
         ];
 
-        // Bloco de custo só quando há tabela de preços (mesma regra do relatório de texto).
-        if !tabela.is_empty() {
+        // Bloco de custo por resposta só quando há tabela de preços (mesma regra do texto).
+        if !tabela_resposta.is_empty() {
             let por_provedor_custo: Vec<(String, Valor)> = self
-                .custo_por_provedor(tabela)
+                .custo_por_provedor(tabela_resposta)
                 .into_iter()
                 .map(|(nome, custo)| (nome, Valor::Numero(custo)))
                 .collect();
             let custo = Valor::Objeto(vec![
                 ("por_provedor".into(), Valor::Objeto(por_provedor_custo)),
-                ("total".into(), Valor::Numero(self.custo_total(tabela))),
+                (
+                    "total".into(),
+                    Valor::Numero(self.custo_total(tabela_resposta)),
+                ),
             ]);
             campos.push(("custo".into(), custo));
+        }
+
+        // Bloco de custo por token só quando há tabela de preços por mil tokens. Ortogonal ao
+        // de cima: um consumidor pode ter um, o outro, os dois ou nenhum.
+        if !tabela_por_token.is_empty() {
+            let por_provedor_custo: Vec<(String, Valor)> = self
+                .custo_por_provedor_por_token(tabela_por_token)
+                .into_iter()
+                .map(|(nome, custo)| (nome, Valor::Numero(custo)))
+                .collect();
+            let custo = Valor::Objeto(vec![
+                ("por_provedor".into(), Valor::Objeto(por_provedor_custo)),
+                (
+                    "total".into(),
+                    Valor::Numero(self.custo_total_por_token(tabela_por_token)),
+                ),
+            ]);
+            campos.push(("custo_por_token".into(), custo));
         }
 
         Valor::Objeto(campos)
@@ -1260,7 +1345,7 @@ mod testes {
     #[test]
     fn json_traz_volume_por_provedor_e_no_topo() {
         let log = "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms (entrada ~10 chars, resposta ~100 chars)\n";
-        let valor = agregar(log).para_json(&BTreeMap::new());
+        let valor = agregar(log).para_json(&BTreeMap::new(), &BTreeMap::new());
         // Topo: volume agregado.
         assert_eq!(
             valor.obter("chars_entrada").unwrap().como_numero(),
@@ -1421,7 +1506,7 @@ mod testes {
 2026-06-30 12:00:01 UTC [roteador] [ok] respondido por 'ollama_local' em 33ms
 ";
         let r = agregar(log);
-        let json = r.para_json(&BTreeMap::new()).para_texto();
+        let json = r.para_json(&BTreeMap::new(), &BTreeMap::new()).para_texto();
         // Topo e por-provedor devem citar a categoria com a CHAVE estável (snake_case).
         assert!(
             json.contains("\"falhas_por_categoria\""),
@@ -1585,6 +1670,68 @@ linha de ruído sem formato
             "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
         let texto2 = agregar(log2).secao_custo(&tabela).unwrap();
         assert!(texto2.contains("ollama_local: 0.00 (sem preço → 0)"));
+    }
+
+    #[test]
+    fn custo_por_token_usa_volume_estimado_e_soma() {
+        // claude com volume (entrada+resposta) registrado; ollama sem volume (formato antigo).
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms (entrada ~1000 chars, resposta ~3000 chars)
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let r = agregar(log);
+        // claude: 4000 chars ≈ 1000 tokens estimados (4000/4). A 2.0 por mil tokens = 2.0.
+        assert_eq!(r.por_provedor["claude"].tokens_estimados(), 1000);
+        let mut tabela = BTreeMap::new();
+        tabela.insert("claude".to_string(), 2.0);
+
+        let por_provedor = r.custo_por_provedor_por_token(&tabela);
+        assert_eq!(por_provedor["claude"], 2.0); // 1000/1000 * 2.0
+        assert_eq!(por_provedor["ollama_local"], 0.0); // sem preço e sem volume = 0
+        assert_eq!(r.custo_total_por_token(&tabela), 2.0);
+    }
+
+    #[test]
+    fn secao_custo_por_token_so_aparece_com_tabela() {
+        let log =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms (entrada ~1000 chars, resposta ~1000 chars)\n";
+        let r = agregar(log);
+
+        // Sem tabela: nada a mostrar (mesma regra do custo por resposta).
+        assert!(r.secao_custo_por_token(&BTreeMap::new()).is_none());
+
+        // Com tabela: 2000 chars ≈ 500 tokens; a 4.0 por mil = 2.00.
+        let mut tabela = BTreeMap::new();
+        tabela.insert("claude".to_string(), 4.0);
+        let texto = r.secao_custo_por_token(&tabela).unwrap();
+        assert!(texto.contains("por mil tokens"));
+        assert!(texto.contains("- claude: 2.00"));
+        assert!(texto.contains("custo total estimado (por token): 2.00"));
+    }
+
+    #[test]
+    fn json_traz_custo_por_token_independente_do_custo_por_resposta() {
+        let log =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms (entrada ~2000 chars, resposta ~2000 chars)\n";
+        let r = agregar(log);
+        // Só preço por token, sem preço por resposta: só o bloco `custo_por_token` aparece.
+        let mut por_token = BTreeMap::new();
+        por_token.insert("claude".to_string(), 3.0); // 4000 chars ≈ 1000 tokens → 3.0
+        let valor = r.para_json(&BTreeMap::new(), &por_token);
+        assert!(valor.obter("custo").is_none());
+        let bloco = valor
+            .obter("custo_por_token")
+            .expect("com preço por token, o bloco existe");
+        assert_eq!(bloco.obter("total").unwrap().como_numero(), Some(3.0));
+        assert_eq!(
+            bloco
+                .obter("por_provedor")
+                .unwrap()
+                .obter("claude")
+                .unwrap()
+                .como_numero(),
+            Some(3.0)
+        );
     }
 
     #[test]
@@ -1764,7 +1911,7 @@ linha de ruído sem formato
         let relatorio = agregar(log);
         let tabela = BTreeMap::new(); // sem preços -> sem bloco "custo"
                                       // Serializa e re-parseia com nosso próprio parser (garante JSON válido de verdade).
-        let texto = relatorio.para_json(&tabela).para_texto();
+        let texto = relatorio.para_json(&tabela, &BTreeMap::new()).para_texto();
         let valor = crate::json::parsear(&texto).expect("JSON gerado deve ser válido");
 
         // Campos de topo batem com os métodos do relatório.
@@ -1889,7 +2036,7 @@ linha de ruído sem formato
 2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
 ";
         let relatorio = agregar(log);
-        let valor = relatorio.para_json(&BTreeMap::new());
+        let valor = relatorio.para_json(&BTreeMap::new(), &BTreeMap::new());
         let marco = crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC").unwrap();
         // Topo: marco absoluto do último provedor bom.
         assert_eq!(
@@ -1918,7 +2065,7 @@ linha de ruído sem formato
 
         let mut tabela = BTreeMap::new();
         tabela.insert("claude".to_string(), 3.0);
-        let valor = relatorio.para_json(&tabela);
+        let valor = relatorio.para_json(&tabela, &BTreeMap::new());
         let custo = valor.obter("custo").expect("com preço, bloco custo existe");
         assert_eq!(custo.obter("total").unwrap().como_numero(), Some(3.0));
         assert_eq!(

@@ -5,7 +5,8 @@
 //!   metricas /caminho/outro.log    # lê outro arquivo de log
 //!   metricas --janela 24h          # só as últimas 24 horas (aceita 90m, 24h, 7d)
 //!   metricas --janela 6h /tmp/x.log
-//!   metricas --custo claude=3 --custo gemini=0.5   # estima custo por provedor
+//!   metricas --custo claude=3 --custo gemini=0.5   # estima custo por RESPOSTA por provedor
+//!   metricas --custo-por-mil-tokens claude=2        # estima custo por TOKEN (~chars/4)
 //!   metricas --json                # saída legível por máquina (dashboard/outro programa)
 //!   metricas --json --janela 24h --custo claude=3   # combina com as demais opções
 //!
@@ -59,15 +60,24 @@ fn main() -> ExitCode {
             // (senão não seria JSON válido para quem consome). O bloco `custo` entra só se
             // houve `--custo`, igual ao relatório de texto.
             if opcoes.json {
-                println!("{}", relatorio.para_json(&opcoes.precos).para_texto());
+                println!(
+                    "{}",
+                    relatorio
+                        .para_json(&opcoes.precos, &opcoes.precos_por_token)
+                        .para_texto()
+                );
                 return ExitCode::SUCCESS;
             }
             if let Some(janela) = opcoes.janela_segundos {
                 println!("(janela: últimas {})", descrever_duracao(janela));
             }
             print!("{relatorio}");
-            // Só imprime o custo se o operador passou pelo menos um `--custo`.
+            // Só imprime o custo por resposta se o operador passou pelo menos um `--custo`.
             if let Some(secao) = relatorio.secao_custo(&opcoes.precos) {
+                print!("{secao}");
+            }
+            // Idem para o custo por token, com `--custo-por-mil-tokens`.
+            if let Some(secao) = relatorio.secao_custo_por_token(&opcoes.precos_por_token) {
                 print!("{secao}");
             }
             // Frescor: há quanto tempo cada provedor bom respondeu. Precisa do relógio real
@@ -96,6 +106,9 @@ struct Opcoes {
     /// Tabela de preços (provedor -> custo por resposta) vinda dos `--custo nome=valor`.
     /// Vazia quando não foi passado nenhum: aí o relatório não mostra custo.
     precos: BTreeMap<String, f64>,
+    /// Tabela de preços (provedor -> custo por MIL tokens estimados) vinda dos
+    /// `--custo-por-mil-tokens nome=valor`. Vazia = sem seção de custo por token.
+    precos_por_token: BTreeMap<String, f64>,
     /// `true` quando `--json`: imprime o relatório como JSON (máquina) em vez de texto.
     json: bool,
 }
@@ -106,6 +119,7 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
     let mut caminho: Option<String> = None;
     let mut janela_segundos: Option<u64> = None;
     let mut precos: BTreeMap<String, f64> = BTreeMap::new();
+    let mut precos_por_token: BTreeMap<String, f64> = BTreeMap::new();
     let mut json = false;
 
     let mut i = 0;
@@ -123,15 +137,26 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
         } else if let Some(valor) = arg.strip_prefix("--janela=") {
             janela_segundos = Some(parsear_duracao(valor)?);
             i += 1;
+        } else if arg == "--custo-por-mil-tokens" {
+            let valor = args
+                .get(i + 1)
+                .ok_or_else(|| format!("{arg} precisa de um valor (ex.: claude=0.5)"))?;
+            let (nome, preco) = parsear_preco(valor, "--custo-por-mil-tokens")?;
+            precos_por_token.insert(nome, preco);
+            i += 2;
+        } else if let Some(valor) = arg.strip_prefix("--custo-por-mil-tokens=") {
+            let (nome, preco) = parsear_preco(valor, "--custo-por-mil-tokens")?;
+            precos_por_token.insert(nome, preco);
+            i += 1;
         } else if arg == "--custo" {
             let valor = args
                 .get(i + 1)
                 .ok_or_else(|| format!("{arg} precisa de um valor (ex.: claude=3)"))?;
-            let (nome, preco) = parsear_preco(valor)?;
+            let (nome, preco) = parsear_preco(valor, "--custo")?;
             precos.insert(nome, preco);
             i += 2;
         } else if let Some(valor) = arg.strip_prefix("--custo=") {
-            let (nome, preco) = parsear_preco(valor)?;
+            let (nome, preco) = parsear_preco(valor, "--custo")?;
             precos.insert(nome, preco);
             i += 1;
         } else if arg.starts_with('-') {
@@ -148,28 +173,31 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
         caminho: caminho.unwrap_or_else(|| telemetria::ARQUIVO_LOG.to_string()),
         janela_segundos,
         precos,
+        precos_por_token,
         json,
     })
 }
 
-/// Interpreta um `nome=valor` de `--custo` (ex.: `claude=3.5`) em (nome, preço).
-/// O preço é o custo por resposta bem-sucedida, na unidade que o operador escolher.
+/// Interpreta um `nome=valor` de um flag de preço (ex.: `claude=3.5`) em (nome, preço).
+/// `flag` é o nome do flag só para a mensagem de erro (`--custo` ou `--custo-por-mil-tokens`),
+/// já que os dois compartilham exatamente o mesmo formato e validação. O preço é sempre
+/// não-negativo e finito, na unidade que o operador escolher.
 /// Devolve `Err(mensagem)` em formato inválido — sem `panic`, sem erro silencioso.
-fn parsear_preco(texto: &str) -> Result<(String, f64), String> {
+fn parsear_preco(texto: &str, flag: &str) -> Result<(String, f64), String> {
     let (nome, valor) = texto
         .split_once('=')
-        .ok_or_else(|| format!("--custo espera nome=valor (ex.: claude=3), veio: '{texto}'"))?;
+        .ok_or_else(|| format!("{flag} espera nome=valor (ex.: claude=3), veio: '{texto}'"))?;
     let nome = nome.trim();
     if nome.is_empty() {
-        return Err(format!("--custo sem nome de provedor: '{texto}'"));
+        return Err(format!("{flag} sem nome de provedor: '{texto}'"));
     }
     let preco: f64 = valor
         .trim()
         .parse()
-        .map_err(|_| format!("--custo com preço inválido: '{valor}' (use um número, ex.: 3.5)"))?;
+        .map_err(|_| format!("{flag} com preço inválido: '{valor}' (use um número, ex.: 3.5)"))?;
     if !preco.is_finite() || preco < 0.0 {
         return Err(format!(
-            "--custo com preço inválido: '{valor}' (precisa ser >= 0)"
+            "{flag} com preço inválido: '{valor}' (precisa ser >= 0)"
         ));
     }
     Ok((nome.to_string(), preco))
@@ -251,16 +279,36 @@ mod testes {
     #[test]
     fn parsear_preco_valida_formato_e_sinal() {
         assert_eq!(
-            parsear_preco("claude=3.5").unwrap(),
+            parsear_preco("claude=3.5", "--custo").unwrap(),
             ("claude".to_string(), 3.5)
         );
         assert_eq!(
-            parsear_preco(" groq = 0 ").unwrap(),
+            parsear_preco(" groq = 0 ", "--custo").unwrap(),
             ("groq".to_string(), 0.0)
         );
-        assert!(parsear_preco("semigual").is_err()); // falta '='
-        assert!(parsear_preco("=3").is_err()); // sem nome
-        assert!(parsear_preco("x=abc").is_err()); // preço não-numérico
-        assert!(parsear_preco("x=-1").is_err()); // preço negativo
+        assert!(parsear_preco("semigual", "--custo").is_err()); // falta '='
+        assert!(parsear_preco("=3", "--custo").is_err()); // sem nome
+        assert!(parsear_preco("x=abc", "--custo").is_err()); // preço não-numérico
+        assert!(parsear_preco("x=-1", "--custo").is_err()); // preço negativo
+                                                            // A mensagem de erro cita o flag recebido (útil pro operador saber qual errou).
+        let msg = parsear_preco("semigual", "--custo-por-mil-tokens").unwrap_err();
+        assert!(msg.contains("--custo-por-mil-tokens"));
+    }
+
+    #[test]
+    fn coleta_precos_por_mil_tokens_separado_do_custo_por_resposta() {
+        let o = interpretar_argumentos(&[
+            "--custo".into(),
+            "claude=3".into(),
+            "--custo-por-mil-tokens".into(),
+            "claude=0.5".into(),
+            "--custo-por-mil-tokens=gemini=0.25".into(),
+        ])
+        .unwrap();
+        // As duas tabelas são independentes: preço por resposta ≠ preço por token.
+        assert_eq!(o.precos.get("claude"), Some(&3.0));
+        assert_eq!(o.precos_por_token.get("claude"), Some(&0.5));
+        assert_eq!(o.precos_por_token.get("gemini"), Some(&0.25));
+        assert!(!o.precos.contains_key("gemini"));
     }
 }

@@ -591,9 +591,32 @@ créditos) — e o relatório fecha com o custo estimado no período:
 Quem não tem preço entra como **0** (ex.: o piso Ollama, local e grátis), marcado para a
 conta ficar transparente. Sem nenhum `--custo`, a seção nem aparece (compatível com o uso
 antigo). **Limitação honesta:** o custo aqui é **por resposta** (todas contam igual). Para
-levar o TAMANHO da troca em conta, veja a seção **Volume** acima — entrada/resposta em chars
-e tokens estimados por provedor; juntas, as duas dão uma aproximação de custo-por-volume, mas
-nenhuma é a fatura exata (o log não guarda a contagem real de tokens do provedor).
+levar o TAMANHO da troca em conta, use `--custo-por-mil-tokens` (abaixo) ou veja a seção
+**Volume** acima.
+
+### Custo estimado por token (`--custo-por-mil-tokens`)
+
+Como os provedores de verdade cobram por **token**, não por resposta, este flag chega mais
+perto da fatura real do que o `--custo` (por resposta, que ignora o tamanho da troca). Passe
+`--custo-por-mil-tokens <provedor>=<valor>` (repetível) com o preço por **mil tokens
+estimados**; o relatório multiplica pelos tokens estimados de cada provedor (≈ `chars/4`, do
+**Volume** acima) e fecha com o total:
+
+```sh
+./target/release/metricas --janela 24h --custo-por-mil-tokens claude=2
+# ... (relatório normal acima) ...
+# -- custo estimado (por mil tokens ~chars/4) --
+# - claude: 0.65
+# - ollama_local: 0.00
+# custo total estimado (por token): 0.65
+```
+
+É **ortogonal** ao `--custo`: pode passar um, o outro, os dois (as seções aparecem
+separadas) ou nenhum. No `--json`, o bloco vira `custo_por_token` (irmão de `custo`), cada um
+só presente se houver o preço correspondente. **Limitação honesta:** os tokens são
+**estimados** por `chars/4` (não a contagem real do tokenizador do provedor) e o volume é o da
+troca (mensagem + resposta), sem o sistema/histórico que o provedor monta por dentro — é
+aproximação de custo, não a fatura exata.
 
 ### Saída para máquina (`--json`)
 
