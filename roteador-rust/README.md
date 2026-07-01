@@ -133,6 +133,22 @@ realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar �
 A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
 mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
 
+### Pulos por disjuntor (economia)
+
+Quando o [disjuntor](#disjuntor--circuit-breaker) está ligado e abre o circuito de um
+provedor, o `rotear()` PULA esse provedor e loga `[disjuntor] <nome>: ... — pulando`.
+As métricas contam esses pulos por provedor (coluna `N disjuntor`, só aparece quando há
+algum) e somam numa linha-resumo. **Cada pulo é a latência de um provedor morto que a
+cadeia NÃO pagou** — é a economia do disjuntor virando número:
+
+```
+# - claude: 0 ok, 0 falha, 0 pulo, 0 cfg, 8 disjuntor | —
+# ...
+# provedores pulados por disjuntor (latência de morto evitada): 8
+```
+
+Com o disjuntor desligado (padrão) não há pulos e essas linhas nem aparecem.
+
 ### Custo estimado (`--custo`)
 
 A dependência também tem **preço**. Passe `--custo <provedor>=<valor>` (repetível) com o

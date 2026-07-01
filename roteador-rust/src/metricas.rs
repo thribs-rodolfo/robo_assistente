@@ -24,6 +24,10 @@ pub struct MetricasProvedor {
     pub pulos: u64,
     /// Problemas de configuração (na ordem sem config, tipo desconhecido).
     pub problemas_config: u64,
+    /// Quantas vezes este provedor foi PULADO pelo disjuntor aberto
+    /// (`[disjuntor] <nome>: disjuntor aberto (...) — pulando`). Cada pulo é a latência de
+    /// um provedor morto que a cadeia NÃO pagou — a economia que o disjuntor entrega.
+    pub disjuntor_pulos: u64,
     /// Soma das latências (ms) das respostas com sucesso — para tirar a média depois.
     pub latencia_total_ms: u128,
 }
@@ -59,6 +63,12 @@ impl Relatorio {
     /// (Cada roteamento termina em exatamente um `[ok]`, enquanto o Ollama segura o piso.)
     pub fn total_roteamentos(&self) -> u64 {
         self.por_provedor.values().map(|m| m.sucessos).sum()
+    }
+
+    /// Total de pulos por disjuntor somando todos os provedores — a economia agregada
+    /// (quantas vezes, no período, a cadeia deixou de pagar a latência de um provedor morto).
+    pub fn total_pulos_disjuntor(&self) -> u64 {
+        self.por_provedor.values().map(|m| m.disjuntor_pulos).sum()
     }
 
     /// Quantas vezes caímos no provedor-piso (qualquer nome contendo "ollama").
@@ -228,6 +238,7 @@ enum Evento {
     Falha { nome: String },
     Pulo { nome: String },
     ProblemaConfig { nome: String },
+    DisjuntorPulo { nome: String },
 }
 
 impl Evento {
@@ -243,6 +254,9 @@ impl Evento {
             Evento::Pulo { nome } => por_provedor.entry(nome).or_default().pulos += 1,
             Evento::ProblemaConfig { nome } => {
                 por_provedor.entry(nome).or_default().problemas_config += 1
+            }
+            Evento::DisjuntorPulo { nome } => {
+                por_provedor.entry(nome).or_default().disjuntor_pulos += 1
             }
         }
     }
@@ -266,6 +280,7 @@ fn separar_linha(linha: &str) -> Option<(Option<u64>, &str)> {
 /// - `[ok] respondido por '<nome>' em <N>ms`
 /// - `[falha] <nome>: <motivo> (após <N>ms) — caindo pro próximo`
 /// - `[pula] <nome>: <motivo>`
+/// - `[disjuntor] <nome>: disjuntor aberto (...) — pulando`
 /// - `<nome>: na ordem mas sem configuração` / `<nome>: tipo '...' desconhecido`
 fn classificar(corpo: &str) -> Option<Evento> {
     if let Some(resto) = corpo.strip_prefix("[ok] respondido por '") {
@@ -280,6 +295,13 @@ fn classificar(corpo: &str) -> Option<Evento> {
     }
     if let Some(resto) = corpo.strip_prefix("[pula] ") {
         return Some(Evento::Pulo {
+            nome: nome_antes_dos_dois_pontos(resto)?,
+        });
+    }
+    // Pulo por disjuntor aberto: `[disjuntor] <nome>: disjuntor aberto (...) — pulando`.
+    // Só o pulo (circuito ABERTO) interessa como métrica de economia; fecha/reabre não são logados.
+    if let Some(resto) = corpo.strip_prefix("[disjuntor] ") {
+        return Some(Evento::DisjuntorPulo {
             nome: nome_antes_dos_dois_pontos(resto)?,
         });
     }
@@ -336,13 +358,28 @@ impl std::fmt::Display for Relatorio {
                 Some(ms) => format!("{ms}ms média"),
                 None => "—".to_string(),
             };
+            // O pulo por disjuntor só aparece quando houve algum — mantém a linha enxuta
+            // no caso comum (disjuntor desligado), sem poluir com "0 disjuntor" em todo lugar.
+            let disjuntor = if m.disjuntor_pulos > 0 {
+                format!(", {} disjuntor", m.disjuntor_pulos)
+            } else {
+                String::new()
+            };
             writeln!(
                 f,
-                "- {nome}: {} ok, {} falha, {} pulo, {} cfg | {latencia}",
+                "- {nome}: {} ok, {} falha, {} pulo, {} cfg{disjuntor} | {latencia}",
                 m.sucessos, m.falhas, m.pulos, m.problemas_config
             )?;
         }
         writeln!(f, "total de roteamentos: {total}")?;
+        // Economia do disjuntor: só reporta se ele chegou a pular alguém no período.
+        let pulos_disjuntor = self.total_pulos_disjuntor();
+        if pulos_disjuntor > 0 {
+            writeln!(
+                f,
+                "provedores pulados por disjuntor (latência de morto evitada): {pulos_disjuntor}"
+            )?;
+        }
         let piso = self.sucessos_no_piso();
         let pct = self.percentual_no_piso();
         writeln!(f, "caiu no piso (Ollama): {piso} de {total} ({pct:.1}%)")?;
@@ -553,6 +590,43 @@ linha de ruído sem formato
             "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
         let texto2 = agregar(log2).secao_custo(&tabela).unwrap();
         assert!(texto2.contains("ollama_local: 0.00 (sem preço → 0)"));
+    }
+
+    #[test]
+    fn classifica_e_conta_pulo_por_disjuntor() {
+        // A linha do disjuntor aberto deve virar um DisjuntorPulo com o nome certo...
+        assert!(matches!(
+            classificar("[disjuntor] claude: disjuntor aberto (3 falhas seguidas) — pulando"),
+            Some(Evento::DisjuntorPulo { nome }) if nome == "claude"
+        ));
+
+        // ...e ser somada por provedor (sem contar como sucesso/falha/pulo comum nem como ruído).
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [disjuntor] claude: disjuntor aberto (3 falhas seguidas) — pulando
+2026-06-30 12:00:01 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:05:00 UTC [roteador] [disjuntor] claude: disjuntor aberto (3 falhas seguidas) — pulando
+2026-06-30 12:05:01 UTC [roteador] [ok] respondido por 'ollama_local' em 31000ms
+";
+        let r = agregar(log);
+        assert_eq!(r.por_provedor["claude"].disjuntor_pulos, 2);
+        assert_eq!(r.por_provedor["claude"].sucessos, 0);
+        assert_eq!(r.por_provedor["claude"].falhas, 0);
+        assert_eq!(r.total_pulos_disjuntor(), 2);
+        assert_eq!(r.linhas_ignoradas, 0); // antes da métrica, essas 2 linhas eram "ruído"
+
+        // O relatório mostra o pulo na linha do claude e a linha-resumo agregada.
+        let texto = format!("{r}");
+        assert!(texto.contains(", 2 disjuntor"));
+        assert!(texto.contains("provedores pulados por disjuntor (latência de morto evitada): 2"));
+    }
+
+    #[test]
+    fn sem_disjuntor_o_relatorio_nao_mostra_a_linha() {
+        // Caso comum (disjuntor desligado): nada de "disjuntor" na saída, para não poluir.
+        let log =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
+        let texto = format!("{}", agregar(log));
+        assert!(!texto.contains("disjuntor"));
     }
 
     #[test]
