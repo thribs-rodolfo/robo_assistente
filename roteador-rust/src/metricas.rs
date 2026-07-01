@@ -929,7 +929,8 @@ fn nome_antes_dos_dois_pontos(corpo: &str) -> Option<String> {
 /// Isola o `<motivo>` (tudo após o PRIMEIRO `:`, que separa o nome do provedor) e o classifica.
 /// O `<motivo>` é o [`Display`](std::fmt::Display) de uma
 /// [`FalhaProvedor`](crate::erro::FalhaProvedor): `http <status>: ...`, `rede: ...`,
-/// `processo: ...`, `indisponível: ...`, `resposta vazia`/`resposta inválida: ...`.
+/// `processo: ...`, `autenticação: ...`, `indisponível: ...`,
+/// `resposta vazia`/`resposta inválida: ...`.
 fn categorizar_falha(corpo_apos_falha: &str) -> CategoriaFalha {
     match corpo_apos_falha.split_once(':') {
         Some((_nome, motivo)) => categorizar_motivo(motivo.trim()),
@@ -963,6 +964,10 @@ fn categorizar_motivo(motivo: &str) -> CategoriaFalha {
     }
     if motivo.starts_with("processo") {
         return CategoriaFalha::Processo;
+    }
+    // "autenticação: ..." = token/chave caiu (a dor #1). Espelha FalhaProvedor::Autenticacao.
+    if motivo.starts_with("autenticação") {
+        return CategoriaFalha::Autenticacao;
     }
     if motivo.starts_with("indisponível") {
         return CategoriaFalha::Configuracao;
@@ -1338,6 +1343,12 @@ mod testes {
         assert_eq!(
             categorizar_motivo("processo: código de saída 1"),
             CategoriaFalha::Processo
+        );
+        // Token/chave caiu (a dor #1): o Claude CLI agora reporta como autenticação, e a leitura
+        // classifica em `auth` — separado do `processo` genérico de antes.
+        assert_eq!(
+            categorizar_motivo("autenticação: código Some(1): OAuth token expired"),
+            CategoriaFalha::Autenticacao
         );
         assert_eq!(
             categorizar_motivo("indisponível: sem chave"),

@@ -18,6 +18,14 @@ pub enum FalhaProvedor {
     Http { status: u16, corpo: String },
     /// O processo externo (`claude --print`) falhou: não encontrado, código != 0, timeout.
     Processo(String),
+    /// Falha de AUTENTICAÇÃO do provedor: chave/token rejeitado ou expirado (o `claude --print`
+    /// saiu reclamando de login/token, um provedor HTTP devolveu 401/403 via processo, etc.).
+    /// É a dor #1 do projeto (o token OAuth do Claude é rotativo e cai): merece um tipo PRÓPRIO
+    /// para aparecer como `auth` na telemetria/métricas em vez de se esconder dentro de
+    /// [`FalhaProvedor::Processo`]. Para o roteador ela se comporta igual a um 401 HTTP: conta
+    /// como indisponibilidade (abre o disjuntor) mas NÃO vale retentativa imediata (repetir na
+    /// hora não conserta um token ruim, e não se martela o Claude — licao-refresh-token-rotativo).
+    Autenticacao(String),
     /// A resposta veio, mas em formato inesperado (JSON sem o campo que esperávamos).
     RespostaInvalida(String),
     /// O provedor respondeu, porém com texto vazio — inútil, então tratamos como falha.
@@ -41,6 +49,8 @@ impl FalhaProvedor {
     ///   indisponível. **Conta.**
     /// - [`FalhaProvedor::Processo`] → `claude --print` falhou (token caído, timeout do
     ///   processo): o provedor está fora pra valer. **Conta.**
+    /// - [`FalhaProvedor::Autenticacao`] → chave/token rejeitado: o provedor está rejeitando
+    ///   (igual a um 401 HTTP). **Conta.**
     /// - [`FalhaProvedor::Http`] → depende do status:
     ///   - `400` (pedido malformado), `404` (rota/modelo não encontrado), `413` (corpo grande
     ///     demais), `422` (conteúdo não-processável) → problema DESTA requisição. **Não conta.**
@@ -58,6 +68,7 @@ impl FalhaProvedor {
         match self {
             FalhaProvedor::Rede(_) => true,
             FalhaProvedor::Processo(_) => true,
+            FalhaProvedor::Autenticacao(_) => true,
             FalhaProvedor::Http { status, .. } => !falha_da_requisicao(*status),
             FalhaProvedor::RespostaVazia => false,
             FalhaProvedor::RespostaInvalida(_) => false,
@@ -101,6 +112,8 @@ impl FalhaProvedor {
             FalhaProvedor::Rede(_) => true,
             FalhaProvedor::Http { status, .. } => status_transitorio(*status),
             FalhaProvedor::Processo(_) => false,
+            // Auth: repetir na hora dá o mesmo erro (token continua ruim) — igual ao 401 HTTP.
+            FalhaProvedor::Autenticacao(_) => false,
             FalhaProvedor::RespostaVazia => false,
             FalhaProvedor::RespostaInvalida(_) => false,
             FalhaProvedor::Indisponivel(_) => false,
@@ -130,6 +143,9 @@ impl fmt::Display for FalhaProvedor {
                 write!(formatador, "http {status}: {}", recortar(corpo, 200))
             }
             FalhaProvedor::Processo(motivo) => write!(formatador, "processo: {motivo}"),
+            FalhaProvedor::Autenticacao(motivo) => {
+                write!(formatador, "autenticação: {motivo}")
+            }
             FalhaProvedor::RespostaInvalida(motivo) => {
                 write!(formatador, "resposta inválida: {motivo}")
             }
@@ -279,5 +295,23 @@ mod testes {
         assert!(auth.indica_provedor_indisponivel() && !auth.vale_retentar());
         let processo = FalhaProvedor::Processo("token caiu".into());
         assert!(processo.indica_provedor_indisponivel() && !processo.vale_retentar());
+    }
+
+    #[test]
+    fn autenticacao_conta_pro_disjuntor_mas_nao_retenta() {
+        // A dor #1 (token do Claude caiu) se comporta EXATAMENTE como um 401 HTTP: conta como
+        // indisponibilidade (abre o disjuntor) mas não vale retentar (o token não volta num
+        // respiro; e não se martela o Claude). Só o RÓTULO muda vs. Processo (para virar `auth`
+        // nas métricas) — o comportamento de roteamento é idêntico.
+        let auth = FalhaProvedor::Autenticacao("token OAuth expirado".into());
+        assert!(auth.indica_provedor_indisponivel());
+        assert!(!auth.vale_retentar());
+    }
+
+    #[test]
+    fn autenticacao_tem_display_com_prefixo_proprio() {
+        // O prefixo "autenticação:" é o que o `bin/metricas` lê no log para classificar `auth`.
+        let auth = FalhaProvedor::Autenticacao("invalid api key".into());
+        assert_eq!(auth.to_string(), "autenticação: invalid api key");
     }
 }

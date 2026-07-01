@@ -150,6 +150,45 @@ struct ProvedorClaudeCli {
     config: ConfigProvedor,
 }
 
+/// Heurística: o texto de erro de um `claude --print` que FALHOU indica falha de
+/// AUTENTICAÇÃO (token/chave OAuth caiu, expirou ou foi rejeitado)?
+///
+/// O CLI é opaco — não devolve um código estruturado de "não autenticado" —, então lemos o
+/// texto que ele imprime no erro procurando marcadores conhecidos (login/token/401...). É
+/// conservadora e SÓ muda um RÓTULO de telemetria: o que não casar continua sendo tratado
+/// como [`FalhaProvedor::Processo`], e os dois se comportam igual no roteamento (contam pro
+/// disjuntor, não retentam). Então um falso positivo aqui não muda o comportamento do robô,
+/// só a categoria no `bin/metricas`. Função **pura** (só olha o texto) → fácil de testar.
+///
+/// `pub(crate)` para os testes do módulo e para eventual reuso por outro provedor de CLI.
+pub(crate) fn parece_falha_de_autenticacao(texto: &str) -> bool {
+    let minusculo = texto.to_lowercase();
+    // Marcadores típicos de erro de credencial do Claude CLI (e de APIs em geral). Todos já
+    // em minúsculo — comparamos contra o texto minusculizado.
+    const MARCADORES: &[&str] = &[
+        "authentication", // "authentication_error", "authentication failed"
+        "unauthorized",
+        "invalid api key",
+        "invalid_api_key",
+        "invalid x-api-key",
+        "oauth",
+        "not logged in",
+        "/login", // o Claude Code pede "run /login"
+        "please log in",
+        "token expired",
+        "expired token",
+        "token has expired",
+        "invalid token",
+        "token revoked",
+        "revoked",
+        "401",
+        "403",
+    ];
+    MARCADORES
+        .iter()
+        .any(|marcador| minusculo.contains(marcador))
+}
+
 impl Provedor for ProvedorClaudeCli {
     fn nome(&self) -> &str {
         &self.config.nome
@@ -268,12 +307,21 @@ impl Provedor for ProvedorClaudeCli {
         }
 
         if !status.success() {
-            let erro = String::from_utf8_lossy(&saida_stderr);
-            return Err(FalhaProvedor::Processo(format!(
-                "código {:?}: {}",
-                status.code(),
-                erro.trim()
-            )));
+            let stderr = String::from_utf8_lossy(&saida_stderr);
+            let stdout = String::from_utf8_lossy(&saida_stdout);
+            let detalhe = format!("código {:?}: {}", status.code(), stderr.trim());
+            // A dor #1 do projeto: o token OAuth do Claude é rotativo e CAI. Quando o
+            // `claude --print` sai reclamando de login/token, classificamos a falha como
+            // AUTENTICAÇÃO — assim ela aparece como `auth` nas métricas "falhas por motivo"
+            // (o sinal mais acionável: "o token caiu") em vez de se esconder no genérico
+            // `Processo`. Heurística sobre o TEXTO de erro, pois o CLI não devolve um código
+            // estruturado; no que não casar, segue `Processo`. O comportamento de
+            // roteamento/disjuntor/retentativa é IDÊNTICO nos dois casos (auth e processo
+            // contam pro disjuntor e não retentam) — só muda o rótulo da telemetria.
+            if parece_falha_de_autenticacao(&stderr) || parece_falha_de_autenticacao(&stdout) {
+                return Err(FalhaProvedor::Autenticacao(detalhe));
+            }
+            return Err(FalhaProvedor::Processo(detalhe));
         }
         let texto = String::from_utf8_lossy(&saida_stdout).trim().to_string();
         if texto.is_empty() {
@@ -843,6 +891,86 @@ mod testes {
                 "esperava falha de timeout, veio: {msg}"
             ),
             outro => panic!("esperava FalhaProvedor::Processo(timeout), veio: {outro:?}"),
+        }
+    }
+
+    #[test]
+    fn classificador_de_auth_reconhece_marcadores_e_ignora_erro_comum() {
+        // Casos que DEVEM virar auth (token/chave caiu — a dor #1 do projeto).
+        for texto in [
+            "Authentication failed: OAuth token expired",
+            "Error: Unauthorized (401)",
+            "invalid api key",
+            "Please run /login to authenticate",
+            "not logged in",
+            "your credentials were revoked",
+            "API error 403: forbidden",
+        ] {
+            assert!(
+                parece_falha_de_autenticacao(texto),
+                "devia detectar auth em: {texto:?}"
+            );
+        }
+        // Casos que NÃO são auth: continuam como Processo (erro genérico do CLI).
+        for texto in [
+            "",
+            "segmentation fault",
+            "model overloaded, try again later",
+            "network unreachable",
+            "unexpected internal error",
+        ] {
+            assert!(
+                !parece_falha_de_autenticacao(texto),
+                "NÃO devia detectar auth em: {texto:?}"
+            );
+        }
+    }
+
+    /// Claude CLI falhando por TOKEN CAÍDO (a dor #1): script falso sai com código 1 e imprime
+    /// um erro de autenticação no stderr. Deve virar [`FalhaProvedor::Autenticacao`] (para
+    /// aparecer como `auth` nas métricas), não o genérico `Processo`. Claude real NUNCA é tocado.
+    #[cfg(unix)]
+    #[test]
+    fn claude_cli_falha_de_token_vira_autenticacao() {
+        let script = escrever_script_temporario(
+            "#!/bin/sh\n# simula token OAuth caído: erro de auth no stderr, sai 1.\necho 'Authentication error: OAuth token has expired. Please run /login.' >&2\nexit 1\n",
+        );
+        let config = config_claude_com(script.clone(), Duration::from_secs(10));
+        let provedor = construir(&config).expect("constrói provedor claude falso");
+
+        let resultado = provedor.responder("oi", &Contexto::default());
+        let _ = std::fs::remove_file(&script);
+
+        match resultado {
+            Err(FalhaProvedor::Autenticacao(msg)) => {
+                assert!(
+                    msg.contains("código"),
+                    "detalhe deve trazer o código: {msg}"
+                );
+            }
+            outro => panic!("esperava FalhaProvedor::Autenticacao, veio: {outro:?}"),
+        }
+    }
+
+    /// Claude CLI falhando por outro motivo (não-auth): continua sendo `Processo`, sem
+    /// regressão. Prova que a heurística é conservadora (não rotula tudo como auth).
+    #[cfg(unix)]
+    #[test]
+    fn claude_cli_falha_generica_continua_processo() {
+        let script = escrever_script_temporario(
+            "#!/bin/sh\necho 'internal error: model overloaded' >&2\nexit 2\n",
+        );
+        let config = config_claude_com(script.clone(), Duration::from_secs(10));
+        let provedor = construir(&config).expect("constrói provedor claude falso");
+
+        let resultado = provedor.responder("oi", &Contexto::default());
+        let _ = std::fs::remove_file(&script);
+
+        match resultado {
+            Err(FalhaProvedor::Processo(msg)) => {
+                assert!(msg.contains("overloaded"), "deve preservar o stderr: {msg}");
+            }
+            outro => panic!("esperava FalhaProvedor::Processo, veio: {outro:?}"),
         }
     }
 }

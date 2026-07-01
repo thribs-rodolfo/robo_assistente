@@ -403,14 +403,14 @@ tem falhas, o relatório abre uma linha com o motivo, deduzido do log:
 falhas por motivo (total): auth 9, timeout/5xx 3, rede 2
 ```
 
-É o sinal **mais acionável** do relatório: o Claude falhando por **`auth`** (HTTP 401/403)
-é o token rotativo caindo — problema de credencial, não de rede; falhando por
-**`timeout/5xx`** é lentidão/instabilidade do serviço. Dois problemas diferentes que a
-contagem crua confunde. Categorias:
+É o sinal **mais acionável** do relatório: o Claude falhando por **`auth`** é o token
+rotativo caindo — problema de credencial, não de rede; falhando por **`timeout/5xx`** é
+lentidão/instabilidade do serviço. Dois problemas diferentes que a contagem crua confunde.
+Categorias:
 
 | motivo (`rótulo` / `chave` JSON)        | de onde vem                                  |
 |-----------------------------------------|----------------------------------------------|
-| `auth` / `autenticacao`                 | HTTP 401/403 (credencial recusada)           |
+| `auth` / `autenticacao`                 | HTTP 401/403 **ou** o `claude --print` reclamando de login/token (credencial recusada) |
 | `rate-limit` / `limite_taxa`            | HTTP 429 (estourou a cota)                    |
 | `timeout/5xx` / `servidor_instavel`     | HTTP 408 ou 5xx (servidor sobrecarregado)     |
 | `rede` / `rede`                         | conexão recusada, host fora, socket estourou |
@@ -424,6 +424,16 @@ A soma das categorias de um provedor sempre bate com o total de `falha` dele. No
 cada provedor ganha um objeto `falhas_por_categoria` (chaves estáveis em snake_case) e há
 um agregado de mesmo nome no topo. Como toda a métrica, é **só leitura** — jamais dispara
 provedor (o Claude nunca é tocado).
+
+**Auth do Claude CLI:** o `claude --print` é opaco — quando o token OAuth cai (a dor #1 do
+projeto), ele apenas sai com código != 0 e imprime um erro. O provedor Claude olha esse
+texto de erro e, se reconhecer marcadores de credencial (`authentication`, `unauthorized`,
+`/login`, `token expired`, `401`…), classifica a falha como **`autenticação`** em vez do
+genérico `processo` — assim o token caindo aparece como **`auth`** aqui, não escondido em
+`processo`. A heurística é conservadora: o que não casar continua `processo`, e o
+comportamento de roteamento é **idêntico** nos dois casos (auth e processo contam pro
+disjuntor e não valem retentativa) — só muda o rótulo da telemetria. Ver
+`provedor::parece_falha_de_autenticacao`.
 
 ### Latência: média + percentis (performance)
 
