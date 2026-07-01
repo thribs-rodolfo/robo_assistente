@@ -101,8 +101,21 @@ esse campo (via `corpo_ollama`, função pura testável) e manda no `prompt` **s
 (`prompt::montar_conversa` — histórico + mensagem), em vez de amassar tudo num texto único.
 Modelos pequenos **aderem melhor** à instrução quando ela vem no campo certo, e a persona
 **não se duplica** dentro do prompt. Sem `sistema` na config (ou vazio), o campo `system`
-nem é enviado — corpo idêntico ao formato antigo (retrocompatível). Provedores que só aceitam
-um bloco de texto (Gemini) seguem usando `prompt::montar_prompt` = sistema + conversa.
+nem é enviado — corpo idêntico ao formato antigo (retrocompatível). O provedor que só aceita
+um bloco de texto (Claude CLI) segue usando `prompt::montar_prompt` = sistema + conversa.
+
+### Provedor Gemini: persona pelo `systemInstruction` nativo + turnos com `role`
+
+O `generateContent` do Gemini tem um campo **`systemInstruction` dedicado** para a persona e
+modela a conversa como uma **lista de turnos** em `contents`, cada um com seu `role`
+(`user`/`model`). Antes o provedor amassava tudo — persona + histórico + mensagem — num
+**único bloco de texto** (`contents[0].parts[0].text`); agora `corpo_gemini` (função pura
+testável) monta o formato nativo: a persona vai no `systemInstruction` (só quando não-vazia,
+igual ao `system` do Ollama e ao papel `system` do OpenAI-compat) e cada turno vira
+`{"role": "user"|"model", "parts":[{"text": …}]}` via `prompt::montar_turnos`. Assim o modelo
+adere melhor à persona e distingue quem falou o quê. Sem persona, o `systemInstruction` nem é
+enviado. **Transporte** já provado ao vivo antes (HTTP 400 estruturado); o corpo é validado
+pelos testes puros (o Gemini de produção segue **sem cota/chave** → não roteável ainda).
 
 ### Provedor `openai_compat`: nuvem (https) OU servidor local (http)
 

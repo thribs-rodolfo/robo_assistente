@@ -64,6 +64,24 @@ pub fn montar_prompt(mensagem: &str, contexto: &Contexto) -> String {
     }
 }
 
+/// Monta a CONVERSA como uma lista de turnos com autor (histórico + mensagem atual),
+/// SEM a instrução de sistema.
+///
+/// Serve aos provedores que modelam a conversa como uma SEQUÊNCIA de turnos com papel
+/// dedicado E têm um campo próprio para a persona — o Gemini `generateContent` usa
+/// `contents` (lista de turnos com `role` user/model) + `systemInstruction` à parte. Assim
+/// o modelo distingue quem falou o quê, em vez de receber tudo amassado num texto só. Cada
+/// provedor mapeia [`Autor`] para o rótulo que sua API espera (Gemini: Usuario→"user",
+/// Assistente→"model"). A persona NÃO entra aqui (vai pelo campo dedicado do provedor).
+pub fn montar_turnos(mensagem: &str, contexto: &Contexto) -> Vec<Turno> {
+    let mut turnos = contexto.historico.clone();
+    turnos.push(Turno {
+        autor: Autor::Usuario,
+        texto: mensagem.to_string(),
+    });
+    turnos
+}
+
 /// Um par (papel, conteúdo) no formato de mensagens estilo OpenAI/Chat.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MensagemChat {
@@ -151,6 +169,34 @@ mod testes {
     fn prompt_sem_sistema_e_so_a_conversa() {
         let contexto = Contexto::vazio();
         assert_eq!(montar_prompt("oi", &contexto), "usuario: oi");
+    }
+
+    #[test]
+    fn turnos_carregam_historico_mais_mensagem_sem_o_sistema() {
+        // montar_turnos NÃO inclui a persona (vai pelo campo dedicado do provedor) e
+        // termina sempre na mensagem atual, marcada como do usuário.
+        let contexto = Contexto {
+            sistema: Some("PERSONA".into()),
+            historico: vec![
+                Turno {
+                    autor: Autor::Usuario,
+                    texto: "oi".into(),
+                },
+                Turno {
+                    autor: Autor::Assistente,
+                    texto: "olá".into(),
+                },
+            ],
+        };
+        let turnos = montar_turnos("tudo bem?", &contexto);
+        assert_eq!(turnos.len(), 3);
+        assert_eq!(turnos[0].autor, Autor::Usuario);
+        assert_eq!(turnos[0].texto, "oi");
+        assert_eq!(turnos[1].autor, Autor::Assistente);
+        assert_eq!(turnos[2].autor, Autor::Usuario);
+        assert_eq!(turnos[2].texto, "tudo bem?");
+        // A persona não aparece em nenhum turno.
+        assert!(turnos.iter().all(|t| t.texto != "PERSONA"));
     }
 
     #[test]

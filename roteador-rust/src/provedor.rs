@@ -520,6 +520,60 @@ impl Provedor for ProvedorOpenAiCompat {
     }
 }
 
+/// Monta o corpo JSON do `generateContent` do Gemini.
+///
+/// Função PURA (sem rede) para ser testável sozinha. Duas melhorias sobre o formato antigo
+/// (que amassava tudo — persona + histórico + mensagem — num único bloco de texto):
+///  - a persona vai pelo campo NATIVO `systemInstruction` (só quando não-vazia), que o
+///    Gemini trata como instrução de sistema — mesma ideia do `system` do Ollama, e do
+///    papel `system` do OpenAI-compat, melhorando a aderência do modelo à persona;
+///  - a conversa vira uma LISTA de turnos em `contents`, cada um com seu `role`
+///    (`user`/`model`), em vez de um texto só — o modelo distingue quem falou o quê.
+///
+/// Sem persona (ou só espaços) o `systemInstruction` nem é enviado — corpo mais enxuto.
+fn corpo_gemini(mensagem: &str, contexto: &Contexto) -> String {
+    // Cada turno da conversa vira {"role": "user"|"model", "parts": [{"text": "..."}]}.
+    // O Gemini nomeia o assistente de "model" (não "assistant" como o OpenAI-compat).
+    let contents: Vec<Valor> = prompt::montar_turnos(mensagem, contexto)
+        .iter()
+        .map(|turno| {
+            let role = match turno.autor {
+                prompt::Autor::Usuario => "user",
+                prompt::Autor::Assistente => "model",
+            };
+            Valor::Objeto(vec![
+                ("role".into(), Valor::Texto(role.into())),
+                (
+                    "parts".into(),
+                    Valor::Lista(vec![Valor::Objeto(vec![(
+                        "text".into(),
+                        Valor::Texto(turno.texto.clone()),
+                    )])]),
+                ),
+            ])
+        })
+        .collect();
+
+    let mut campos = vec![("contents".to_string(), Valor::Lista(contents))];
+
+    // Persona pelo campo nativo `systemInstruction` — só quando há instrução de fato.
+    if let Some(sistema) = contexto.sistema.as_deref().map(str::trim) {
+        if !sistema.is_empty() {
+            campos.push((
+                "systemInstruction".to_string(),
+                Valor::Objeto(vec![(
+                    "parts".into(),
+                    Valor::Lista(vec![Valor::Objeto(vec![(
+                        "text".into(),
+                        Valor::Texto(sistema.to_string()),
+                    )])]),
+                )]),
+            ));
+        }
+    }
+    Valor::Objeto(campos).para_texto()
+}
+
 struct ProvedorGeminiRest {
     config: ConfigProvedor,
 }
@@ -557,18 +611,7 @@ impl Provedor for ProvedorGeminiRest {
             "https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={chave}"
         );
 
-        // Corpo {"contents":[{"parts":[{"text": prompt}]}]}.
-        let corpo = Valor::Objeto(vec![(
-            "contents".into(),
-            Valor::Lista(vec![Valor::Objeto(vec![(
-                "parts".into(),
-                Valor::Lista(vec![Valor::Objeto(vec![(
-                    "text".into(),
-                    Valor::Texto(prompt::montar_prompt(mensagem, contexto)),
-                )])]),
-            )])]),
-        )])
-        .para_texto();
+        let corpo = corpo_gemini(mensagem, contexto);
 
         let resposta = https::post_json(&url, &corpo, &[], self.config.timeout)?;
         if resposta.status != 200 {
@@ -729,6 +772,91 @@ mod testes {
                 raiz.obter("prompt").and_then(Valor::como_texto),
                 Some("usuario: oi")
             );
+        }
+    }
+
+    #[test]
+    fn corpo_gemini_usa_system_instruction_nativo_e_turnos_com_role() {
+        use crate::prompt::{Autor, Contexto, Turno};
+        let contexto = Contexto {
+            sistema: Some("Você é o Ronaldo.".into()),
+            historico: vec![
+                Turno {
+                    autor: Autor::Usuario,
+                    texto: "oi".into(),
+                },
+                Turno {
+                    autor: Autor::Assistente,
+                    texto: "olá!".into(),
+                },
+            ],
+        };
+        let corpo = corpo_gemini("tudo bem?", &contexto);
+        let raiz = json::parsear(&corpo).unwrap();
+
+        // A persona vai no campo NATIVO `systemInstruction.parts[0].text`.
+        let sistema = raiz
+            .obter("systemInstruction")
+            .and_then(|s| s.obter("parts"))
+            .and_then(|p| p.indice(0))
+            .and_then(|p| p.obter("text"))
+            .and_then(Valor::como_texto);
+        assert_eq!(sistema, Some("Você é o Ronaldo."));
+
+        // A conversa vira turnos com `role` user/model (o assistente é "model" no Gemini),
+        // terminando na mensagem atual do usuário — e a persona NÃO se repete aqui.
+        let papel = |i: usize| {
+            raiz.obter("contents")
+                .and_then(|c| c.indice(i))
+                .and_then(|t| t.obter("role"))
+                .and_then(Valor::como_texto)
+                .map(str::to_string)
+        };
+        let texto = |i: usize| {
+            raiz.obter("contents")
+                .and_then(|c| c.indice(i))
+                .and_then(|t| t.obter("parts"))
+                .and_then(|p| p.indice(0))
+                .and_then(|p| p.obter("text"))
+                .and_then(Valor::como_texto)
+                .map(str::to_string)
+        };
+        assert_eq!(papel(0).as_deref(), Some("user"));
+        assert_eq!(texto(0).as_deref(), Some("oi"));
+        assert_eq!(papel(1).as_deref(), Some("model"));
+        assert_eq!(texto(1).as_deref(), Some("olá!"));
+        assert_eq!(papel(2).as_deref(), Some("user"));
+        assert_eq!(texto(2).as_deref(), Some("tudo bem?"));
+        // A persona não vaza para dentro dos turnos da conversa.
+        assert!(!corpo.contains("\"user\",\"parts\":[{\"text\":\"Você é o Ronaldo."));
+    }
+
+    #[test]
+    fn corpo_gemini_sem_persona_nao_manda_system_instruction() {
+        use crate::prompt::Contexto;
+        // Sem sistema (ou só espaços) o `systemInstruction` nem aparece — corpo enxuto.
+        for contexto in [
+            Contexto::vazio(),
+            Contexto {
+                sistema: Some("   ".into()),
+                historico: vec![],
+            },
+        ] {
+            let corpo = corpo_gemini("oi", &contexto);
+            let raiz = json::parsear(&corpo).unwrap();
+            assert!(
+                raiz.obter("systemInstruction").is_none(),
+                "não deve mandar systemInstruction vazio"
+            );
+            // A mensagem atual vira o único turno, com role user.
+            let primeiro_texto = raiz
+                .obter("contents")
+                .and_then(|c| c.indice(0))
+                .and_then(|t| t.obter("parts"))
+                .and_then(|p| p.indice(0))
+                .and_then(|p| p.obter("text"))
+                .and_then(Valor::como_texto);
+            assert_eq!(primeiro_texto, Some("oi"));
         }
     }
 
