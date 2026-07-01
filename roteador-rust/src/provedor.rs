@@ -189,6 +189,59 @@ pub(crate) fn parece_falha_de_autenticacao(texto: &str) -> bool {
         .any(|marcador| minusculo.contains(marcador))
 }
 
+/// Quantas vezes tentar subir o `claude` diante de ETXTBSY antes de desistir.
+/// Pequeno: o erro é fugaz (dura o intervalo entre `fork` e `execve` de outro processo).
+const TENTATIVAS_ETXTBSY: u32 = 5;
+/// Espera entre tentativas em ETXTBSY. Curto porque estamos no caminho de uma mensagem viva.
+const ESPERA_ETXTBSY: Duration = Duration::from_millis(20);
+
+/// Sobe o `claude --print` com os três canos em pipe, RETENTANDO só em ETXTBSY
+/// ("Text file busy", os error 26).
+///
+/// ETXTBSY é TRANSITÓRIO e não é culpa nossa: o `execve` de um arquivo falha enquanto
+/// ALGUM processo ainda o mantém aberto para ESCRITA. Na prática isso acontece quando
+/// (a) um atualizador está regravando o binário do `claude` naquele átimo, ou (b) — no
+/// nosso conjunto de testes — o `fork` de um teste vizinho herdou por um instante o
+/// descritor de escrita do script falso recém-criado (janela entre `fork` e `execve`).
+/// Não é falta de permissão nem binário ausente: repetir em alguns milissegundos resolve.
+///
+/// Só ETXTBSY é retentado; QUALQUER outro erro sobe na hora como [`FalhaProvedor::Processo`]
+/// (sem mascarar "comando não encontrado" ou "permissão negada"). No caminho feliz a 1ª
+/// tentativa quase sempre sobe → comportamento idêntico ao de antes.
+fn subir_processo_claude(comando: &str) -> Result<std::process::Child, FalhaProvedor> {
+    // ETXTBSY não tem uma variante estável em `std::io::ErrorKind`, então comparamos o
+    // código de erro cru do SO (26 no Linux). `raw_os_error()` devolve `Some(26)` nesse caso.
+    const ETXTBSY: i32 = 26;
+
+    let mut tentativa: u32 = 0;
+    loop {
+        let resultado = Command::new(comando)
+            .arg("--print")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        match resultado {
+            Ok(filho) => return Ok(filho),
+            Err(erro) => {
+                let e_txt_busy = erro.raw_os_error() == Some(ETXTBSY);
+                tentativa += 1;
+                if e_txt_busy && tentativa < TENTATIVAS_ETXTBSY {
+                    // Erro fugaz: espera um pouco e tenta de novo (sem estourar log — é normal).
+                    std::thread::sleep(ESPERA_ETXTBSY);
+                    continue;
+                }
+                // Ou não é ETXTBSY (sobe já), ou esgotamos as tentativas (o binário segue
+                // ocupado): erro tratado como valor, nunca engolido.
+                return Err(FalhaProvedor::Processo(format!(
+                    "não subiu '{comando}': {erro}"
+                )));
+            }
+        }
+    }
+}
+
 impl Provedor for ProvedorClaudeCli {
     fn nome(&self) -> &str {
         &self.config.nome
@@ -206,13 +259,7 @@ impl Provedor for ProvedorClaudeCli {
         let prompt_texto = prompt::montar_prompt(mensagem, contexto);
 
         // Sobe o processo com stdin/stdout em pipe para enviarmos o prompt e lermos a resposta.
-        let mut filho = Command::new(comando)
-            .arg("--print")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| FalhaProvedor::Processo(format!("não subiu '{comando}': {e}")))?;
+        let mut filho = subir_processo_claude(comando)?;
 
         // Tomamos posse dos três canos. Precisamos DRENAR stdout e stderr enquanto o
         // processo ainda roda: se a resposta do Claude passar do buffer do pipe do SO
@@ -870,6 +917,43 @@ mod testes {
         let texto = resultado.expect("resposta longa deve voltar inteira, sem deadlock/timeout");
         assert_eq!(texto.len(), 200_000, "todo o stdout deve ser lido");
         assert!(texto.chars().all(|c| c == 'x'));
+    }
+
+    /// Regressão de flakiness: o `subir_processo_claude` RECUPERA de ETXTBSY ("Text file
+    /// busy"). Forçamos o erro mantendo o script aberto para ESCRITA — nesse estado o
+    /// `execve` falha com ETXTBSY — e, de outra thread, SOLTAMOS o arquivo depois de um
+    /// tempinho. As primeiras tentativas batem no ETXTBSY e retentam; assim que o escritor
+    /// solta, uma tentativa sobe. Prova que a rajada de `cargo test` (forks vizinhos herdando
+    /// o descritor de escrita por um átimo) não derruba mais o teste do Claude falso.
+    #[cfg(unix)]
+    #[test]
+    fn claude_cli_recupera_de_texto_ocupado_etxtbsy() {
+        use std::fs::OpenOptions;
+
+        let script = escrever_script_temporario("#!/bin/sh\nprintf 'ok'\n");
+
+        // Segura um descritor de ESCRITA aberto: enquanto ele viver, execve → ETXTBSY.
+        let escritor = OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("abre o script para escrita (força ETXTBSY)");
+
+        // Solta o escritor depois de ~60ms — dentro da janela das retentativas
+        // (5 × 20ms = 100ms), então uma das próximas tentativas do execve sobe.
+        let soltar = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(escritor); // fecha o fd de escrita → execve deixa de dar ETXTBSY
+        });
+
+        let config = config_claude_com(script.clone(), Duration::from_secs(5));
+        let provedor = construir(&config).expect("constrói provedor claude falso");
+        let resultado = provedor.responder("oi", &Contexto::default());
+
+        let _ = soltar.join();
+        let _ = std::fs::remove_file(&script);
+
+        let texto = resultado.expect("deve recuperar do ETXTBSY e responder");
+        assert_eq!(texto.trim(), "ok");
     }
 
     /// O timeout continua matando um processo lento (sem deixá-lo órfão) e devolvendo falha.

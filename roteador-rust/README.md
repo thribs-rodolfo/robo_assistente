@@ -382,6 +382,16 @@ processo sair (o padrão ingênuo) causa **deadlock** — e o roteador o mataria
 **falso** (um script de shell temporário; o Claude real nunca é disparado): resposta de ~200 KB
 volta inteira, e um processo lento é morto no prazo.
 
+**Retentativa em `ETXTBSY` ("Text file busy"):** subir o `claude` pode falhar com o os error 26
+quando algum processo ainda mantém o executável aberto para **escrita** no instante do `execve`
+(ex.: um atualizador regravando o binário; ou, nos nossos testes em paralelo, o `fork` de um
+teste vizinho que herdou por um átimo o descritor de escrita do script falso). O erro é
+**transitório** — repetir em alguns milissegundos resolve —, então `subir_processo_claude`
+retenta só nesse caso (até 5 vezes, 20 ms entre elas); qualquer outro erro sobe na hora, sem ser
+mascarado. No caminho feliz a 1ª tentativa sobe → comportamento idêntico ao de antes. Um teste
+força o `ETXTBSY` segurando o script aberto para escrita e o solta de outra thread, provando que
+o roteador recupera.
+
 ## Uso
 
 ```sh
