@@ -70,6 +70,14 @@ fn main() -> ExitCode {
             if let Some(secao) = relatorio.secao_custo(&opcoes.precos) {
                 print!("{secao}");
             }
+            // Frescor: há quanto tempo cada provedor bom respondeu. Precisa do relógio real
+            // ("há X"); se ele estiver quebrado (< 1970), pulamos só esta seção — o resto do
+            // relatório e o `--json` (que traz epochs absolutos) seguem válidos.
+            if let Some(agora) = agora_epoch() {
+                if let Some(secao) = relatorio.secao_frescor(agora) {
+                    print!("{secao}");
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(erro) => {

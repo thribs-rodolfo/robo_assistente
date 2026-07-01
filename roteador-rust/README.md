@@ -188,6 +188,28 @@ cadeia NÃO pagou** — é a economia do disjuntor virando número:
 
 Com o disjuntor desligado (padrão) não há pulos e essas linhas nem aparecem.
 
+### Frescor: há quanto tempo cada provedor bom respondeu
+
+A **sequência no piso** conta EVENTOS (quantos roteamentos seguidos caíram no Ollama). Mas
+um bot de pouco tráfego pode ter sequência 3 e estar sem provedor bom **há horas** — 3
+mensagens em 6 horas. O **frescor** fecha esse buraco medindo dependência em **tempo de
+parede**: por provedor, há quanto tempo ele respondeu pela última vez, e a linha-chave
+**"sem provedor bom há X"** (tempo desde o último sucesso FORA do piso):
+
+```
+# -- frescor (último sucesso por provedor) --
+# - claude: há 6h15min (2026-06-30 22:19:34 UTC)
+# - ollama_local: há 4h27min (2026-07-01 00:08:08 UTC)
+# sem provedor bom há 6h15min
+```
+
+Enquanto a cadeia de cima estiver caindo, esse número **cresce em tempo real**. Se nenhum
+provedor bom respondeu no período, a linha vira "nenhum provedor bom respondeu (só o piso)".
+A seção só aparece quando há pelo menos um sucesso datado, e some se o relógio do sistema
+estiver quebrado (o resto do relatório segue válido). No `--json`, cada provedor traz
+`ultimo_sucesso_epoch` e o topo traz `ultimo_sucesso_fora_do_piso_epoch` (epochs absolutos —
+a máquina calcula a idade sozinha, sem depender de "agora").
+
 ### Custo estimado (`--custo`)
 
 A dependência também tem **preço**. Passe `--custo <provedor>=<valor>` (repetível) com o

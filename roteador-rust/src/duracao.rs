@@ -48,6 +48,45 @@ pub fn descrever_duracao(segundos: u64) -> String {
     }
 }
 
+/// Descrição APROXIMADA de uma duração em segundos, para frases do tipo "há X".
+///
+/// Diferente de [`descrever_duracao`] (que só usa a maior unidade que divide EXATAMENTE),
+/// aqui a duração quase nunca é redonda (ex.: "há 6902s"), então mostramos as DUAS maiores
+/// unidades não-nulas para ficar legível: `1d4h`, `2h3min`, `5min12s`, `45s`. Serve ao
+/// relatório de frescor ("último ok do claude há 2h3min").
+pub fn descrever_aproximada(segundos: u64) -> String {
+    const DIA: u64 = 86_400;
+    const HORA: u64 = 3_600;
+    const MINUTO: u64 = 60;
+    if segundos >= DIA {
+        let dias = segundos / DIA;
+        let horas = (segundos % DIA) / HORA;
+        if horas > 0 {
+            format!("{dias}d{horas}h")
+        } else {
+            format!("{dias}d")
+        }
+    } else if segundos >= HORA {
+        let horas = segundos / HORA;
+        let minutos = (segundos % HORA) / MINUTO;
+        if minutos > 0 {
+            format!("{horas}h{minutos}min")
+        } else {
+            format!("{horas}h")
+        }
+    } else if segundos >= MINUTO {
+        let minutos = segundos / MINUTO;
+        let resto = segundos % MINUTO;
+        if resto > 0 {
+            format!("{minutos}min{resto}s")
+        } else {
+            format!("{minutos}min")
+        }
+    } else {
+        format!("{segundos}s")
+    }
+}
+
 #[cfg(test)]
 mod testes {
     use super::*;
@@ -75,5 +114,17 @@ mod testes {
         assert_eq!(descrever_duracao(21_600), "6h");
         assert_eq!(descrever_duracao(5_400), "90min");
         assert_eq!(descrever_duracao(45), "45s");
+    }
+
+    #[test]
+    fn descreve_aproximada_com_duas_unidades() {
+        assert_eq!(descrever_aproximada(45), "45s");
+        assert_eq!(descrever_aproximada(60), "1min");
+        assert_eq!(descrever_aproximada(312), "5min12s");
+        assert_eq!(descrever_aproximada(3_600), "1h");
+        assert_eq!(descrever_aproximada(7_380), "2h3min");
+        assert_eq!(descrever_aproximada(86_400), "1d");
+        assert_eq!(descrever_aproximada(100_800), "1d4h");
+        assert_eq!(descrever_aproximada(0), "0s");
     }
 }

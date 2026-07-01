@@ -33,6 +33,12 @@ pub struct MetricasProvedor {
     /// percentis (p50/p95) e o máximo — a média sozinha esconde a "cauda" (o provedor que
     /// costuma ir bem mas às vezes trava). É o sinal de performance que o goal pede.
     pub latencias_ms: Vec<u128>,
+    /// Instante (epoch UTC, segundos) do ÚLTIMO sucesso deste provedor com carimbo legível,
+    /// ou `None` se ele nunca respondeu (ou só respondeu em linhas sem timestamp). É a base do
+    /// "frescor": há quanto tempo cada provedor de fato funcionou pela última vez. Mede
+    /// dependência em TEMPO DE PAREDE — complementa a sequência, que conta EVENTOS: um bot com
+    /// pouco tráfego pode ter sequência 3 mas estar sem provedor bom há horas.
+    pub ultimo_sucesso_epoch: Option<u64>,
 }
 
 impl MetricasProvedor {
@@ -172,6 +178,68 @@ impl Relatorio {
         Some(texto)
     }
 
+    /// Instante (epoch UTC) do último sucesso de QUALQUER provedor bom (fora do piso), ou
+    /// `None` se nenhum provedor bom respondeu no período (ou só em linhas sem timestamp).
+    /// É o marco a partir do qual medimos "há quanto tempo o robô está sem provedor bom".
+    pub fn ultimo_sucesso_fora_do_piso_epoch(&self) -> Option<u64> {
+        self.por_provedor
+            .iter()
+            .filter(|(nome, _)| !eh_piso(nome))
+            .filter_map(|(_, m)| m.ultimo_sucesso_epoch)
+            .max()
+    }
+
+    /// Há quantos SEGUNDOS o último provedor bom respondeu, relativo a `agora_epoch`.
+    /// `None` se nunca houve resposta boa datada no período. Saturante: se o relógio estiver
+    /// atrás do carimbo (ex.: linha do "futuro"), devolve 0 em vez de estourar.
+    ///
+    /// Este é o sinal-chave: enquanto a cadeia de cima estiver caindo, esse número CRESCE em
+    /// tempo real — mede há quanto tempo dependemos SÓ do piso, mesmo com pouquíssimo tráfego.
+    pub fn segundos_desde_ultimo_sucesso_fora_do_piso(&self, agora_epoch: u64) -> Option<u64> {
+        self.ultimo_sucesso_fora_do_piso_epoch()
+            .map(|marco| agora_epoch.saturating_sub(marco))
+    }
+
+    /// Bloco de texto do "frescor": por provedor, há quanto tempo respondeu pela última vez,
+    /// e a linha-chave "sem provedor bom há X". Depende do `agora_epoch` (relógio real), por
+    /// isso fica fora do [`Display`](std::fmt::Display) — igual a [`Relatorio::secao_custo`].
+    ///
+    /// Devolve `None` quando nenhum provedor tem sucesso datado (nada útil a dizer sobre
+    /// frescor). Só leitura de dados já agregados — não dispara provedor nenhum.
+    pub fn secao_frescor(&self, agora_epoch: u64) -> Option<String> {
+        use crate::duracao::descrever_aproximada;
+
+        // Junta quem tem pelo menos um sucesso com carimbo; sem ninguém, não há o que mostrar.
+        let com_data: Vec<(&String, u64)> = self
+            .por_provedor
+            .iter()
+            .filter_map(|(nome, m)| m.ultimo_sucesso_epoch.map(|e| (nome, e)))
+            .collect();
+        if com_data.is_empty() {
+            return None;
+        }
+
+        let mut texto = String::from("-- frescor (último sucesso por provedor) --\n");
+        for (nome, epoch) in &com_data {
+            // `saturating_sub` protege contra carimbo à frente do relógio (não estoura).
+            let idade = descrever_aproximada(agora_epoch.saturating_sub(*epoch));
+            texto.push_str(&format!(
+                "- {nome}: há {idade} ({})\n",
+                crate::telemetria::formatar_data_utc(*epoch)
+            ));
+        }
+
+        // A linha-chave de dependência em tempo de parede.
+        match self.segundos_desde_ultimo_sucesso_fora_do_piso(agora_epoch) {
+            Some(seg) => texto.push_str(&format!(
+                "sem provedor bom há {}\n",
+                descrever_aproximada(seg)
+            )),
+            None => texto.push_str("nenhum provedor bom respondeu no período (só o piso)\n"),
+        }
+        Some(texto)
+    }
+
     /// Serializa o relatório inteiro como um [`Valor`](crate::json::Valor) JSON — a MESMA
     /// informação que o [`Display`](std::fmt::Display) mostra ao humano, mas legível por
     /// máquina (dashboard, alerta externo, outro programa que consome o log).
@@ -189,6 +257,11 @@ impl Relatorio {
         // respondeu (distingue "0ms" de "sem dado" — honestidade na telemetria).
         let latencia_ou_nulo = |valor: Option<u128>| match valor {
             Some(ms) => Valor::Numero(ms as f64),
+            None => Valor::Nulo,
+        };
+        // Epoch -> Valor: número quando há, `null` quando o provedor nunca respondeu datado.
+        let epoch_ou_nulo = |valor: Option<u64>| match valor {
+            Some(e) => Valor::Numero(e as f64),
             None => Valor::Nulo,
         };
 
@@ -224,6 +297,10 @@ impl Relatorio {
                     "latencia_maxima_ms".into(),
                     latencia_ou_nulo(metricas.latencia_maxima_ms()),
                 ),
+                (
+                    "ultimo_sucesso_epoch".into(),
+                    epoch_ou_nulo(metricas.ultimo_sucesso_epoch),
+                ),
             ]);
             provedores.push((nome.clone(), objeto_provedor));
         }
@@ -250,6 +327,12 @@ impl Relatorio {
             (
                 "maior_sequencia_no_piso".into(),
                 Valor::Numero(self.maior_sequencia_no_piso as f64),
+            ),
+            // Marco absoluto do último provedor bom; a máquina consumidora calcula a idade
+            // sozinha ("agora - este epoch"), então aqui não precisamos do relógio.
+            (
+                "ultimo_sucesso_fora_do_piso_epoch".into(),
+                epoch_ou_nulo(self.ultimo_sucesso_fora_do_piso_epoch()),
             ),
             (
                 "pulos_disjuntor".into(),
@@ -360,7 +443,8 @@ fn agregar_interno(conteudo: &str, janela: Option<std::ops::RangeInclusive<u64>>
                 if let Evento::Sucesso { nome, .. } = &evento {
                     relatorio.registrar_sequencia(nome);
                 }
-                evento.aplicar(&mut relatorio.por_provedor);
+                // Passamos o carimbo para o sucesso registrar QUANDO respondeu (frescor).
+                evento.aplicar(carimbo, &mut relatorio.por_provedor);
             }
             None => relatorio.linhas_ignoradas += 1,
         }
@@ -379,12 +463,18 @@ enum Evento {
 
 impl Evento {
     /// Soma este evento nas métricas do provedor correspondente (cria a entrada se faltar).
-    fn aplicar(self, por_provedor: &mut BTreeMap<String, MetricasProvedor>) {
+    ///
+    /// `carimbo` é o instante (epoch UTC) da linha, ou `None` quando o timestamp era ilegível;
+    /// só o sucesso o usa, para guardar QUANDO o provedor respondeu pela última vez (frescor).
+    fn aplicar(self, carimbo: Option<u64>, por_provedor: &mut BTreeMap<String, MetricasProvedor>) {
         match self {
             Evento::Sucesso { nome, latencia_ms } => {
                 let m = por_provedor.entry(nome).or_default();
                 m.sucessos += 1;
                 m.latencias_ms.push(latencia_ms);
+                // Fica com o instante MAIS RECENTE visto (o log é cronológico, mas o `max`
+                // é robusto a linhas fora de ordem). `None` de carimbo ilegível não sobrescreve.
+                m.ultimo_sucesso_epoch = m.ultimo_sucesso_epoch.max(carimbo);
             }
             Evento::Falha { nome } => por_provedor.entry(nome).or_default().falhas += 1,
             Evento::Pulo { nome } => por_provedor.entry(nome).or_default().pulos += 1,
@@ -876,6 +966,119 @@ linha de ruído sem formato
 
         // Sem tabela de preços, o bloco de custo NÃO existe (espelha o relatório de texto).
         assert!(valor.obter("custo").is_none());
+    }
+
+    #[test]
+    fn frescor_guarda_ultimo_sucesso_por_provedor() {
+        // claude respondeu 2x (a segunda mais tarde), ollama 1x. O último sucesso de cada um
+        // deve ser o instante da linha MAIS RECENTE dele.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:05:00 UTC [roteador] [ok] respondido por 'claude' em 900ms
+";
+        let r = agregar(log);
+        let esperado_claude = crate::telemetria::epoch_de_data_utc("2026-06-30 12:05:00 UTC");
+        let esperado_ollama = crate::telemetria::epoch_de_data_utc("2026-06-30 12:01:00 UTC");
+        assert_eq!(
+            r.por_provedor["claude"].ultimo_sucesso_epoch,
+            esperado_claude
+        );
+        assert_eq!(
+            r.por_provedor["ollama_local"].ultimo_sucesso_epoch,
+            esperado_ollama
+        );
+        // O último provedor BOM (fora do piso) é o claude das 12:05.
+        assert_eq!(r.ultimo_sucesso_fora_do_piso_epoch(), esperado_claude);
+    }
+
+    #[test]
+    fn frescor_sem_sucesso_datado_fica_sem_marco() {
+        // Só falhas/pulos: ninguém respondeu -> sem marco de frescor, seção some.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [pula] groq: sem chave
+2026-06-30 12:00:01 UTC [roteador] [falha] claude: 401 (após 90ms) — caindo pro próximo
+";
+        let r = agregar(log);
+        assert_eq!(r.ultimo_sucesso_fora_do_piso_epoch(), None);
+        assert_eq!(
+            r.segundos_desde_ultimo_sucesso_fora_do_piso(2_000_000_000),
+            None
+        );
+        assert!(r.secao_frescor(2_000_000_000).is_none());
+    }
+
+    #[test]
+    fn segundos_desde_ultimo_sucesso_conta_do_agora() {
+        // Um sucesso bom às 12:00; "agora" 2h depois -> 7200s sem provedor bom.
+        let log = "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms\n";
+        let r = agregar(log);
+        let marco = crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC").unwrap();
+        let agora = marco + 7_200;
+        assert_eq!(
+            r.segundos_desde_ultimo_sucesso_fora_do_piso(agora),
+            Some(7_200)
+        );
+        // Relógio ATRÁS do carimbo (linha do "futuro") satura em 0, não estoura.
+        assert_eq!(
+            r.segundos_desde_ultimo_sucesso_fora_do_piso(marco - 10),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn secao_frescor_mostra_provedor_e_linha_chave() {
+        // claude respondeu às 12:00; ollama às 12:30. "Agora" = 12:00 + 3h.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms
+2026-06-30 12:30:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let r = agregar(log);
+        let marco_claude = crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC").unwrap();
+        let agora = marco_claude + 3 * 3_600; // 15:00
+        let texto = r.secao_frescor(agora).unwrap();
+        // O claude bom respondeu há 3h; a linha-chave mede desde o último BOM (não o piso).
+        assert!(texto.contains("- claude: há 3h"));
+        assert!(texto.contains("sem provedor bom há 3h"));
+        // O ollama entra na lista por provedor (respondeu há 2h30min), mas NÃO conta como bom.
+        assert!(texto.contains("- ollama_local: há 2h30min"));
+    }
+
+    #[test]
+    fn secao_frescor_avisa_quando_so_o_piso_respondeu() {
+        // Só o piso respondeu: a linha-chave deixa explícito que nunca teve provedor bom.
+        let log =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
+        let r = agregar(log);
+        let agora = crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC").unwrap() + 60;
+        let texto = r.secao_frescor(agora).unwrap();
+        assert!(texto.contains("- ollama_local: há 1min"));
+        assert!(texto.contains("nenhum provedor bom respondeu no período (só o piso)"));
+    }
+
+    #[test]
+    fn para_json_inclui_frescor() {
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let relatorio = agregar(log);
+        let valor = relatorio.para_json(&BTreeMap::new());
+        let marco = crate::telemetria::epoch_de_data_utc("2026-06-30 12:00:00 UTC").unwrap();
+        // Topo: marco absoluto do último provedor bom.
+        assert_eq!(
+            valor
+                .obter("ultimo_sucesso_fora_do_piso_epoch")
+                .unwrap()
+                .como_numero(),
+            Some(marco as f64)
+        );
+        // Por provedor: o claude traz seu próprio epoch de último sucesso.
+        let claude = valor.obter("provedores").unwrap().obter("claude").unwrap();
+        assert_eq!(
+            claude.obter("ultimo_sucesso_epoch").unwrap().como_numero(),
+            Some(marco as f64)
+        );
     }
 
     #[test]
