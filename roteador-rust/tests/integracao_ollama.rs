@@ -30,6 +30,11 @@ fn ollama_local_responde_de_verdade() {
             habilitado: true,
         }],
         disjuntor: Default::default(),
+        // Telemetria para arquivo temporário: não suja o log de produção (fonte das métricas).
+        telemetria_log: std::env::temp_dir()
+            .join("roteador-integracao-ollama.log")
+            .to_string_lossy()
+            .to_string(),
     };
 
     let resposta = rotear(

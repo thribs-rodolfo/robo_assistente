@@ -85,6 +85,13 @@ Mora **fora do repositório**, com as chaves reais, em
 
 O bloco `disjuntor` é **opcional** e vem **desligado por padrão** (ver abaixo).
 
+Campo opcional `"telemetria_log"`: caminho do log de telemetria. Ausente → o log de
+produção (`/var/log/roteador-provedores.log`). Existe para NÃO haver um caminho global
+escondido: os testes apontam para um arquivo temporário e o roteamento fica **hermético**
+— antes, rodar `cargo test` gravava linhas de teste (portas mortas) no log de produção e
+**contaminava as métricas** do `bin/metricas` (a medida de "% no piso", que é o objetivo
+do projeto). Produção não precisa declará-lo.
+
 ## Disjuntor / circuit breaker (`disjuntor`)
 
 **Problema que resolve:** o Claude é frágil (o token OAuth cai). Com o roteamento linear
@@ -97,6 +104,17 @@ inteiro antes de cair pro Ollama — lentidão à toa, mensagem após mensagem.
 passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabre.
 
 - **O piso (Ollama local, último da ordem) NUNCA é pulado** → o robô nunca fica mudo.
+- **Só falhas de INDISPONIBILIDADE abrem o circuito.** Nem toda falha significa "provedor
+  fora". O roteador classifica (ver `FalhaProvedor::indica_provedor_indisponivel`):
+  - **Conta** (provedor fora/rejeitando, vale pular): rede/timeout, processo (`claude`
+    caído), HTTP `401`/`403` (auth), `408`, `429` (rate limit), `5xx`.
+  - **Não conta** (o provedor está de pé, o problema é DAQUELA mensagem): HTTP
+    `400`/`404`/`413`/`422`, resposta vazia, resposta em formato inesperado.
+  Assim uma mensagem malformada (um 400) não "queima" um provedor são — abrir o circuito
+  dele jogaria as próximas mensagens boas no piso à toa, o **oposto** do objetivo do
+  projeto (depender MENOS do piso). Uma falha que não conta deixa o contador de falhas
+  seguidas **intacto** (nem soma, nem zera) e sai como `[roteamento] <nome>: falha da
+  mensagem — não conta pro disjuntor`.
 - **Estado operacional e efêmero** em `/var/log/roteador-disjuntor.estado` (fora do repo);
   ausente/corrompido → tudo tratado como fechado (= comportamento antigo). Degrada com graça.
 - **Desligado por padrão:** sem o bloco `disjuntor` (ou com `"habilitado": false`), o

@@ -61,6 +61,11 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
             cooldown_segundos: 3_600,
             caminho_estado: caminho_estado.clone(),
         },
+        // Telemetria para arquivo temporário: não suja o log de produção (fonte das métricas).
+        telemetria_log: std::env::temp_dir()
+            .join("roteador-integracao-disjuntor.log")
+            .to_string_lossy()
+            .to_string(),
     };
 
     // Duas rodadas: o topo morto falha nas duas; o Ollama (piso) responde nas duas.

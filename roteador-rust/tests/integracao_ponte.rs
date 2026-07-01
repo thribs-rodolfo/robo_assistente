@@ -69,7 +69,7 @@ fn saude_responde_ok_e_secret_errado_da_403() {
     );
     let roteador = escrever_temp(
         "ponte-teste-rot-18991.json",
-        r#"{"ordem_fallback":["ollama_local"],"provedores":{"ollama_local":{"tipo":"ollama","url_base":"http://127.0.0.1:11434","modelo":"qwen2.5:1.5b","timeout_segundos":5}}}"#,
+        r#"{"ordem_fallback":["ollama_local"],"telemetria_log":"/tmp/roteador-integracao-ponte.log","provedores":{"ollama_local":{"tipo":"ollama","url_base":"http://127.0.0.1:11434","modelo":"qwen2.5:1.5b","timeout_segundos":5}}}"#,
     );
     let _ponte = subir_ponte(endereco, &bots, &roteador);
 
@@ -109,7 +109,7 @@ fn caminho_completo_roteia_pelo_ollama() {
     );
     let roteador = escrever_temp(
         "ponte-teste-rot-18992.json",
-        r#"{"ordem_fallback":["ollama_local"],"provedores":{"ollama_local":{"tipo":"ollama","url_base":"http://127.0.0.1:11434","modelo":"qwen2.5:1.5b","timeout_segundos":60}}}"#,
+        r#"{"ordem_fallback":["ollama_local"],"telemetria_log":"/tmp/roteador-integracao-ponte.log","provedores":{"ollama_local":{"tipo":"ollama","url_base":"http://127.0.0.1:11434","modelo":"qwen2.5:1.5b","timeout_segundos":60}}}"#,
     );
     let _ponte = subir_ponte(endereco, &bots, &roteador);
 

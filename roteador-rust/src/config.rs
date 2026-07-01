@@ -84,6 +84,12 @@ pub struct Config {
     pub provedores: Vec<ConfigProvedor>,
     /// Ajustes do disjuntor. Ausente no JSON => `Default` (desligado).
     pub disjuntor: ConfigDisjuntor,
+    /// Onde gravar a telemetria (qual provedor respondeu, por que caiu). Ausente no JSON =>
+    /// o log de produção ([`crate::telemetria::ARQUIVO_LOG`]). Existe para NÃO ter um caminho
+    /// global escondido: os testes apontam para um arquivo temporário e o roteamento fica
+    /// hermético — antes, rodar `cargo test` sujava o log de produção e contaminava as
+    /// métricas reais do `bin/metricas` (a medida de "% no piso" que é o objetivo do projeto).
+    pub telemetria_log: String,
 }
 
 impl Config {
@@ -128,10 +134,19 @@ pub fn interpretar(texto_json: &str) -> Result<Config, ErroRoteador> {
 
     let disjuntor = interpretar_disjuntor(raiz.obter("disjuntor"));
 
+    // Caminho da telemetria: opcional. Ausente => o log de produção. Só quem escreve teste
+    // aponta para outro lugar (arquivo temporário) para não sujar as métricas reais.
+    let telemetria_log = raiz
+        .obter("telemetria_log")
+        .and_then(Valor::como_texto)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::telemetria::ARQUIVO_LOG.to_string());
+
     Ok(Config {
         ordem_fallback,
         provedores,
         disjuntor,
+        telemetria_log,
     })
 }
 
@@ -279,6 +294,20 @@ mod testes {
         assert!(config.disjuntor.habilitado);
         assert_eq!(config.disjuntor.limiar_falhas, 3);
         assert_eq!(config.disjuntor.cooldown_segundos, 60);
+    }
+
+    #[test]
+    fn telemetria_log_ausente_usa_o_padrao_de_producao() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.telemetria_log, crate::telemetria::ARQUIVO_LOG);
+    }
+
+    #[test]
+    fn telemetria_log_pode_ser_sobrescrito() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"telemetria_log":"/tmp/x.log"}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.telemetria_log, "/tmp/x.log");
     }
 
     #[test]

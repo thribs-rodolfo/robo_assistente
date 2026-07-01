@@ -81,7 +81,7 @@ pub fn rotear(
             Some(c) => c,
             None => {
                 let motivo = format!("{nome}: na ordem mas sem configuração");
-                telemetria::registrar(&motivo);
+                telemetria::registrar_em(&config.telemetria_log, &motivo);
                 motivos.push(motivo);
                 continue;
             }
@@ -92,7 +92,7 @@ pub fn rotear(
             Some(p) => p,
             None => {
                 let motivo = format!("{nome}: tipo '{}' desconhecido", config_provedor.tipo);
-                telemetria::registrar(&motivo);
+                telemetria::registrar_em(&config.telemetria_log, &motivo);
                 motivos.push(motivo);
                 continue;
             }
@@ -102,7 +102,7 @@ pub fn rotear(
         // Pré-checagem: desabilitado ou sem chave? Pula sem gastar rede.
         if let Err(falha) = provedor.disponivel() {
             let motivo = format!("{nome}: {falha}");
-            telemetria::registrar(&format!("[pula] {motivo}"));
+            telemetria::registrar_em(&config.telemetria_log, &format!("[pula] {motivo}"));
             motivos.push(motivo);
             continue;
         }
@@ -113,7 +113,7 @@ pub fn rotear(
         if usar_disjuntor && indice != indice_piso && estado_disjuntor.esta_aberto(nome, agora) {
             let falhas = estado_disjuntor.falhas_de(nome);
             let motivo = format!("{nome}: disjuntor aberto ({falhas} falhas seguidas) — pulando");
-            telemetria::registrar(&format!("[disjuntor] {motivo}"));
+            telemetria::registrar_em(&config.telemetria_log, &format!("[disjuntor] {motivo}"));
             motivos.push(motivo);
             continue;
         }
@@ -125,7 +125,10 @@ pub fn rotear(
         let ms = inicio.elapsed().as_millis();
         match resultado {
             Ok(texto) => {
-                telemetria::registrar(&format!("[ok] respondido por '{nome}' em {ms}ms"));
+                telemetria::registrar_em(
+                    &config.telemetria_log,
+                    &format!("[ok] respondido por '{nome}' em {ms}ms"),
+                );
                 // Sucesso fecha o circuito (provedor voltou a si) e persiste o estado.
                 if usar_disjuntor {
                     estado_disjuntor.apos_sucesso(nome);
@@ -138,12 +141,30 @@ pub fn rotear(
             }
             Err(falha) => {
                 let motivo = format!("{nome}: {falha}");
-                telemetria::registrar(&format!(
-                    "[falha] {motivo} (após {ms}ms) — caindo pro próximo"
-                ));
-                // Registra a falha no disjuntor; se cruzar o limiar, abre o circuito.
+                telemetria::registrar_em(
+                    &config.telemetria_log,
+                    &format!("[falha] {motivo} (após {ms}ms) — caindo pro próximo"),
+                );
+                // Registra a falha no disjuntor SÓ se ela indicar que o PROVEDOR está
+                // indisponível (rede/timeout/processo/401/429/5xx). Falha específica da
+                // mensagem (HTTP 400/404/413/422, resposta vazia/inválida) NÃO abre o
+                // circuito: puniria um provedor são, jogando o robô no piso à toa — o
+                // oposto do objetivo (depender MENOS do piso). Ver
+                // FalhaProvedor::indica_provedor_indisponivel.
                 if usar_disjuntor {
-                    estado_disjuntor.apos_falha(nome, agora, &config.disjuntor);
+                    if falha.indica_provedor_indisponivel() {
+                        estado_disjuntor.apos_falha(nome, agora, &config.disjuntor);
+                    } else {
+                        // Deixa o contador de falhas seguidas intacto (nem soma, nem zera):
+                        // esta falha não diz nada sobre a saúde do provedor. Só registra,
+                        // sem prefixo de métrica, para não contaminar a contagem do bin/metricas.
+                        telemetria::registrar_em(
+                            &config.telemetria_log,
+                            &format!(
+                                "[roteamento] {nome}: falha da mensagem — não conta pro disjuntor"
+                            ),
+                        );
+                    }
                 }
                 motivos.push(motivo);
             }
@@ -185,12 +206,18 @@ mod testes {
     use super::*;
     use crate::config::interpretar;
 
+    /// Log temporário para os testes: mantém o roteamento HERMÉTICO e NÃO suja o log de
+    /// produção (a fonte das métricas do `bin/metricas`). Antes, sem isto, cada `cargo test`
+    /// gravava `[falha]`/`[ok]` de porta-morta no log real e contaminava a medida "% no piso".
+    const LOG_TESTE: &str = "/tmp/roteador-testes-lib.log";
+
     #[test]
     fn ordem_vazia_da_erro() {
         let config = Config {
             ordem_fallback: vec![],
             provedores: vec![],
             disjuntor: Default::default(),
+            telemetria_log: LOG_TESTE.to_string(),
         };
         let erro = rotear("oi", &Contexto::vazio(), &config).unwrap_err();
         assert_eq!(erro, ErroRoteador::SemProvedores);
@@ -199,7 +226,10 @@ mod testes {
     #[test]
     fn provedor_na_ordem_sem_config_e_pulado_e_falha_no_fim() {
         // 'fantasma' está na ordem mas não nos provedores; nenhum provedor é construído.
-        let config = interpretar(r#"{"ordem_fallback":["fantasma"],"provedores":{}}"#).unwrap();
+        let config = interpretar(
+            r#"{"ordem_fallback":["fantasma"],"provedores":{},"telemetria_log":"/tmp/roteador-testes-lib.log"}"#,
+        )
+        .unwrap();
         let erro = rotear("oi", &Contexto::vazio(), &config).unwrap_err();
         assert_eq!(erro, ErroRoteador::SemProvedores);
     }
@@ -212,6 +242,7 @@ mod testes {
         let config = interpretar(
             r#"{
                 "ordem_fallback": ["groq", "ollama_local"],
+                "telemetria_log": "/tmp/roteador-testes-lib.log",
                 "provedores": {
                     "groq": {"tipo":"openai_compat","chave":"x","habilitado":true},
                     "ollama_local": {"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}
@@ -262,7 +293,8 @@ mod testes {
                     "topo": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}},
                     "piso": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}}
                 }},
-                "disjuntor": {{"habilitado": true, "cooldown_segundos": 100000, "caminho_estado": "{caminho}"}}
+                "disjuntor": {{"habilitado": true, "cooldown_segundos": 100000, "caminho_estado": "{caminho}"}},
+                "telemetria_log": "/tmp/roteador-testes-lib.log"
             }}"#
         );
         let config = interpretar(&json).unwrap();
@@ -283,6 +315,46 @@ mod testes {
             }
             outro => panic!("esperava TodosFalharam, veio {outro:?}"),
         }
+
+        let _ = std::fs::remove_file(&caminho);
+    }
+
+    #[test]
+    fn falha_de_rede_abre_o_disjuntor() {
+        use crate::disjuntor::EstadoDisjuntor;
+
+        // Prova a FIAÇÃO da classificação: uma falha de REDE (porta morta) indica que o
+        // provedor está indisponível, então DEVE contar pro disjuntor e, com limiar 1,
+        // abrir o circuito. (A classificação em si é testada em erro.rs; aqui provamos que
+        // o `rotear` de fato só chama `apos_falha` para falhas de indisponibilidade.)
+        let caminho = std::env::temp_dir().join("roteador-lib-rede-abre.estado");
+        let caminho = caminho.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&caminho);
+
+        // Cadeia [alvo, piso], os dois em porta morta -> falha de rede rápida. Disjuntor
+        // ligado com limiar 1: uma única falha de rede no 'alvo' já abre o circuito dele.
+        let json = format!(
+            r#"{{
+                "ordem_fallback": ["alvo", "piso"],
+                "provedores": {{
+                    "alvo": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}},
+                    "piso": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}}
+                }},
+                "disjuntor": {{"habilitado": true, "limiar_falhas": 1, "cooldown_segundos": 100000, "caminho_estado": "{caminho}"}},
+                "telemetria_log": "/tmp/roteador-testes-lib.log"
+            }}"#
+        );
+        let config = interpretar(&json).unwrap();
+
+        // Uma rodada: o 'alvo' falha por rede e deve abrir; o roteamento inteiro falha
+        // (os dois em porta morta), o que é esperado — o que importa é o estado gravado.
+        let _ = rotear("oi", &Contexto::vazio(), &config);
+
+        let estado = EstadoDisjuntor::carregar(&caminho);
+        assert!(
+            estado.esta_aberto("alvo", instante_epoch_segundos()),
+            "falha de rede devia contar e abrir o circuito do 'alvo'"
+        );
 
         let _ = std::fs::remove_file(&caminho);
     }
