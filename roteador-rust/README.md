@@ -375,6 +375,29 @@ estiver quebrado (o resto do relatório segue válido). No `--json`, cada proved
 `ultimo_sucesso_epoch` e o topo traz `ultimo_sucesso_fora_do_piso_epoch` (epochs absolutos —
 a máquina calcula a idade sozinha, sem depender de "agora").
 
+### Volume (caracteres processados / tokens estimados)
+
+O custo por resposta (abaixo) trata toda troca como igual, mas uma resposta de 20 chars e
+outra de 4000 chars pesam MUITO diferente. Para fechar essa dimensão, cada `[ok]` passou a
+registrar o **volume da troca** — `(entrada ~N chars, resposta ~M chars)` — e o relatório
+agrega, por provedor, quanto texto entrou e saiu, mais um proxy de tokens (≈ chars/4):
+
+```
+-- volume (caracteres processados) --
+- claude: 1060 chars (entrada 40, resposta 1020) ~265 tokens
+- ollama_local: 105 chars (entrada 15, resposta 90) ~26 tokens
+volume total: 1165 chars (entrada 55, resposta 1110)
+```
+
+- **Só aparece quando há volume registrado** (logs novos); em logs antigos a seção some e os
+  campos ficam 0 — retrocompatível, sem regressão.
+- Mede o volume da **troca** (mensagem do usuário + resposta), *não* o prompt completo em
+  tokens: o preâmbulo de sistema e o histórico montados dentro de cada provedor não entram.
+  Os `~tokens` são uma **estimativa grosseira** (chars/4), ordem de grandeza — não a fatura.
+- No `--json`: cada provedor ganha `chars_entrada`/`chars_resposta`/`tokens_estimados`, e o
+  topo traz `chars_entrada`/`chars_resposta` agregados.
+- Continua **só leitura** do log: nunca dispara provedor.
+
 ### Custo estimado (`--custo`)
 
 A dependência também tem **preço**. Passe `--custo <provedor>=<valor>` (repetível) com o
@@ -392,9 +415,10 @@ créditos) — e o relatório fecha com o custo estimado no período:
 
 Quem não tem preço entra como **0** (ex.: o piso Ollama, local e grátis), marcado para a
 conta ficar transparente. Sem nenhum `--custo`, a seção nem aparece (compatível com o uso
-antigo). **Limitação honesta:** o log guarda QUEM respondeu, não o tamanho da resposta em
-tokens — então o custo é **por resposta**, uma aproximação de dependência-em-dinheiro, não
-a fatura exata.
+antigo). **Limitação honesta:** o custo aqui é **por resposta** (todas contam igual). Para
+levar o TAMANHO da troca em conta, veja a seção **Volume** acima — entrada/resposta em chars
+e tokens estimados por provedor; juntas, as duas dão uma aproximação de custo-por-volume, mas
+nenhuma é a fatura exata (o log não guarda a contagem real de tokens do provedor).
 
 ### Saída para máquina (`--json`)
 

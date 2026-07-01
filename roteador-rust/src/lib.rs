@@ -145,9 +145,20 @@ pub fn rotear(
         let ms = inicio.elapsed().as_millis();
         match resultado {
             Ok(texto) => {
+                // Volume da conversa: quantos caracteres ENTRARAM (a mensagem do usuário) e
+                // quantos VOLTARAM (a resposta do provedor). É o proxy honesto de "quanto"
+                // cada provedor processou — a dimensão de custo que faltava, já que o log só
+                // sabia QUEM respondeu, não QUANTO. Contamos `chars()` (não bytes) para medir
+                // caracteres reais mesmo com acento/emoji. Aproximação assumida: NÃO inclui o
+                // preâmbulo de sistema nem o histórico montados dentro do provedor — mede o
+                // volume da troca (entrada+saída), não o prompt completo em tokens.
+                let chars_entrada = mensagem.chars().count();
+                let chars_resposta = texto.chars().count();
                 telemetria::registrar_em(
                     &config.telemetria_log,
-                    &format!("[ok] respondido por '{nome}' em {ms}ms"),
+                    &format!(
+                        "[ok] respondido por '{nome}' em {ms}ms (entrada ~{chars_entrada} chars, resposta ~{chars_resposta} chars)"
+                    ),
                 );
                 // Sombra: o disjuntor ATIVO teria PULADO este provedor, mas ele RESPONDEU. É um
                 // FALSO POSITIVO — ligar o disjuntor agora custaria esta resposta boa. Sinal de

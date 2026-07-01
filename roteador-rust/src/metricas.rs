@@ -63,6 +63,15 @@ pub struct MetricasProvedor {
     /// rotativo caindo ([[licao-refresh-token-rotativo]]); falhando por TIMEOUT é lentidão — dois
     /// problemas diferentes que a contagem crua confunde. A soma dos valores == `falhas`.
     pub falhas_por_categoria: BTreeMap<CategoriaFalha, u64>,
+    /// Soma dos caracteres de ENTRADA (mensagens do usuário) que este provedor processou com
+    /// sucesso — lido do trecho `(entrada ~N chars, ...)` do `[ok]`. É a metade "prompt" do
+    /// volume: quanto texto entrou. Zero em logs no formato antigo (sem o trecho de volume).
+    pub chars_entrada: u64,
+    /// Soma dos caracteres de RESPOSTA que este provedor devolveu com sucesso — a metade
+    /// "saída" do volume. Entrada + resposta = volume total da troca. Com um custo por 1k
+    /// caracteres (ou o proxy de tokens ≈ chars/4), vira a estimativa de custo por VOLUME que o
+    /// goal pede — fecha a limitação do custo-por-resposta, que ignorava o tamanho de cada troca.
+    pub chars_resposta: u64,
 }
 
 /// Por que um provedor falhou, deduzido do motivo que o [`crate::lib`] gravou no log.
@@ -165,6 +174,20 @@ impl MetricasProvedor {
         self.latencias_ms.iter().copied().max()
     }
 
+    /// Volume total (entrada + resposta) de caracteres que este provedor moveu com sucesso.
+    /// É o "quanto" que o provedor processou, complementando o "quantas vezes" dos sucessos.
+    pub fn chars_total(&self) -> u64 {
+        self.chars_entrada + self.chars_resposta
+    }
+
+    /// Estimativa GROSSEIRA de tokens a partir do volume de caracteres (~4 chars por token,
+    /// heurística comum para texto em inglês/português). É só um proxy educacional para a
+    /// dimensão de custo-por-token: o log não guarda a contagem real de tokens do provedor,
+    /// então derivamos uma aproximação do volume. Não é a fatura — é ordem de grandeza.
+    pub fn tokens_estimados(&self) -> u64 {
+        self.chars_total() / 4
+    }
+
     /// Resumo das falhas por categoria em uma linha (ex.: `auth 3, rede 2`), ou string vazia
     /// quando não houve falha. Itera o `BTreeMap` (ordenado pela ordem do enum) → saída estável.
     pub fn resumo_falhas(&self) -> String {
@@ -209,6 +232,52 @@ impl Relatorio {
     /// ou os provedores remotos andaram).
     pub fn total_retentativas(&self) -> u64 {
         self.por_provedor.values().map(|m| m.retentativas).sum()
+    }
+
+    /// Volume total de caracteres de ENTRADA somando todos os provedores no período.
+    pub fn total_chars_entrada(&self) -> u64 {
+        self.por_provedor.values().map(|m| m.chars_entrada).sum()
+    }
+
+    /// Volume total de caracteres de RESPOSTA somando todos os provedores no período.
+    pub fn total_chars_resposta(&self) -> u64 {
+        self.por_provedor.values().map(|m| m.chars_resposta).sum()
+    }
+
+    /// Volume total (entrada + resposta) de caracteres no período — o "quanto" agregado.
+    pub fn total_chars(&self) -> u64 {
+        self.total_chars_entrada() + self.total_chars_resposta()
+    }
+
+    /// Bloco de texto do VOLUME por provedor (entrada/resposta em chars + tokens estimados) e o
+    /// total, ou `None` quando nenhum provedor moveu caractere (logs antigos, sem volume) — aí a
+    /// seção nem aparece, mantendo o relatório enxuto. Fecha a dimensão "custo por volume/token":
+    /// entrada+resposta por provedor é a base para estimar custo por tamanho de troca, não só por
+    /// resposta. Só leitura de dados já agregados (nunca dispara provedor → Claude intocado).
+    pub fn secao_volume(&self) -> Option<String> {
+        if self.total_chars() == 0 {
+            return None;
+        }
+        let mut texto = String::from("-- volume (caracteres processados) --\n");
+        for (nome, m) in &self.por_provedor {
+            if m.chars_total() == 0 {
+                continue; // provedor sem volume registrado (formato antigo) fica de fora
+            }
+            texto.push_str(&format!(
+                "- {nome}: {} chars (entrada {}, resposta {}) ~{} tokens\n",
+                m.chars_total(),
+                m.chars_entrada,
+                m.chars_resposta,
+                m.tokens_estimados()
+            ));
+        }
+        texto.push_str(&format!(
+            "volume total: {} chars (entrada {}, resposta {})\n",
+            self.total_chars(),
+            self.total_chars_entrada(),
+            self.total_chars_resposta()
+        ));
+        Some(texto)
     }
 
     /// Falhas por categoria somando TODOS os provedores — "de que os provedores morreram no
@@ -475,6 +544,18 @@ impl Relatorio {
                     "falhas_por_categoria".into(),
                     objeto_categorias(&metricas.falhas_por_categoria),
                 ),
+                (
+                    "chars_entrada".into(),
+                    Valor::Numero(metricas.chars_entrada as f64),
+                ),
+                (
+                    "chars_resposta".into(),
+                    Valor::Numero(metricas.chars_resposta as f64),
+                ),
+                (
+                    "tokens_estimados".into(),
+                    Valor::Numero(metricas.tokens_estimados() as f64),
+                ),
             ]);
             provedores.push((nome.clone(), objeto_provedor));
         }
@@ -531,6 +612,14 @@ impl Relatorio {
             (
                 "falhas_por_categoria".into(),
                 objeto_categorias(&self.falhas_por_categoria_total()),
+            ),
+            (
+                "chars_entrada".into(),
+                Valor::Numero(self.total_chars_entrada() as f64),
+            ),
+            (
+                "chars_resposta".into(),
+                Valor::Numero(self.total_chars_resposta() as f64),
             ),
             (
                 "linhas_ignoradas".into(),
@@ -651,6 +740,10 @@ enum Evento {
     Sucesso {
         nome: String,
         latencia_ms: u128,
+        /// Caracteres de entrada e de resposta, quando o log traz o trecho de volume
+        /// (`(entrada ~N chars, resposta ~M chars)`); `(0, 0)` no formato antigo.
+        chars_entrada: u64,
+        chars_resposta: u64,
     },
     Falha {
         nome: String,
@@ -686,10 +779,18 @@ impl Evento {
     /// só o sucesso o usa, para guardar QUANDO o provedor respondeu pela última vez (frescor).
     fn aplicar(self, carimbo: Option<u64>, por_provedor: &mut BTreeMap<String, MetricasProvedor>) {
         match self {
-            Evento::Sucesso { nome, latencia_ms } => {
+            Evento::Sucesso {
+                nome,
+                latencia_ms,
+                chars_entrada,
+                chars_resposta,
+            } => {
                 let m = por_provedor.entry(nome).or_default();
                 m.sucessos += 1;
                 m.latencias_ms.push(latencia_ms);
+                // Volume da troca: acumula entrada e resposta (0 e 0 em logs antigos, sem efeito).
+                m.chars_entrada += chars_entrada;
+                m.chars_resposta += chars_resposta;
                 // Fica com o instante MAIS RECENTE visto (o log é cronológico, mas o `max`
                 // é robusto a linhas fora de ordem). `None` de carimbo ilegível não sobrescreve.
                 m.ultimo_sucesso_epoch = m.ultimo_sucesso_epoch.max(carimbo);
@@ -749,7 +850,16 @@ fn classificar(corpo: &str) -> Option<Evento> {
     if let Some(resto) = corpo.strip_prefix("[ok] respondido por '") {
         let nome = resto.split('\'').next()?.to_string();
         let latencia_ms = extrair_latencia_ms(resto).unwrap_or(0);
-        return Some(Evento::Sucesso { nome, latencia_ms });
+        // Volume opcional: logs novos trazem `(entrada ~N chars, resposta ~M chars)`; nos
+        // antigos os marcadores não existem e ambos ficam 0 (retrocompatível).
+        let chars_entrada = extrair_chars_apos(resto, "entrada ~").unwrap_or(0);
+        let chars_resposta = extrair_chars_apos(resto, "resposta ~").unwrap_or(0);
+        return Some(Evento::Sucesso {
+            nome,
+            latencia_ms,
+            chars_entrada,
+            chars_resposta,
+        });
     }
     if let Some(resto) = corpo.strip_prefix("[falha] ") {
         return Some(Evento::Falha {
@@ -877,6 +987,19 @@ fn nome_entre_aspas(depois_da_aspa: &str) -> Option<String> {
     }
 }
 
+/// Acha o número logo depois de um `marcador` (ex.: `"entrada ~"`) numa frase como
+/// `(entrada ~42 chars, resposta ~118 chars)`. Anda a partir do fim do marcador juntando os
+/// dígitos até o primeiro não-dígito. `None` se o marcador não existe ou não vier número.
+/// Usado para ler o volume (chars de entrada/resposta) do `[ok]`; ausência = formato antigo.
+fn extrair_chars_apos(texto: &str, marcador: &str) -> Option<u64> {
+    let posicao = texto.find(marcador)? + marcador.len();
+    let digitos: String = texto[posicao..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digitos.parse().ok()
+}
+
 /// Acha o número de milissegundos numa frase como `... em 33ms` ou `... (após 1200ms)`.
 /// Procura o sufixo `ms` e anda para trás juntando os dígitos coladinhos antes dele.
 fn extrair_latencia_ms(texto: &str) -> Option<u128> {
@@ -991,6 +1114,12 @@ impl std::fmt::Display for Relatorio {
                 )?;
             }
         }
+        // Volume (chars processados por provedor + tokens estimados): só aparece se houve
+        // volume registrado (logs novos). É a dimensão de custo-por-tamanho da troca.
+        if let Some(secao) = self.secao_volume() {
+            // `secao_volume` já termina com '\n'; usamos write! para não duplicar a quebra.
+            write!(f, "{secao}")?;
+        }
         let piso = self.sucessos_no_piso();
         let pct = self.percentual_no_piso();
         writeln!(f, "caiu no piso (Ollama): {piso} de {total} ({pct:.1}%)")?;
@@ -1039,13 +1168,117 @@ mod testes {
 
     #[test]
     fn classifica_sucesso_com_nome_e_latencia() {
+        // Formato ANTIGO (sem volume): latência lida, chars ficam 0 (retrocompatível).
         match classificar("[ok] respondido por 'claude' em 850ms") {
-            Some(Evento::Sucesso { nome, latencia_ms }) => {
+            Some(Evento::Sucesso {
+                nome,
+                latencia_ms,
+                chars_entrada,
+                chars_resposta,
+            }) => {
                 assert_eq!(nome, "claude");
                 assert_eq!(latencia_ms, 850);
+                assert_eq!(chars_entrada, 0);
+                assert_eq!(chars_resposta, 0);
             }
             outro => panic!("esperava Sucesso, veio outro: {:?}", outro.is_some()),
         }
+        // Formato NOVO (com volume): extrai entrada e resposta em chars, além da latência.
+        match classificar(
+            "[ok] respondido por 'claude' em 850ms (entrada ~12 chars, resposta ~340 chars)",
+        ) {
+            Some(Evento::Sucesso {
+                nome,
+                latencia_ms,
+                chars_entrada,
+                chars_resposta,
+            }) => {
+                assert_eq!(nome, "claude");
+                assert_eq!(
+                    latencia_ms, 850,
+                    "latência não pode se confundir com o volume"
+                );
+                assert_eq!(chars_entrada, 12);
+                assert_eq!(chars_resposta, 340);
+            }
+            outro => panic!("esperava Sucesso, veio outro: {:?}", outro.is_some()),
+        }
+    }
+
+    #[test]
+    fn extrai_chars_apos_marcador() {
+        let linha = "em 850ms (entrada ~12 chars, resposta ~340 chars)";
+        assert_eq!(extrair_chars_apos(linha, "entrada ~"), Some(12));
+        assert_eq!(extrair_chars_apos(linha, "resposta ~"), Some(340));
+        // Marcador ausente (formato antigo) -> None, que o chamador vira 0.
+        assert_eq!(extrair_chars_apos("em 850ms", "entrada ~"), None);
+    }
+
+    #[test]
+    fn agrega_volume_por_provedor_e_no_total() {
+        // Duas respostas do claude (com volume) e uma do ollama (sem volume, formato antigo).
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms (entrada ~10 chars, resposta ~100 chars)
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'claude' em 900ms (entrada ~20 chars, resposta ~200 chars)
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let r = agregar(log);
+        let claude = &r.por_provedor["claude"];
+        assert_eq!(claude.chars_entrada, 30); // 10 + 20
+        assert_eq!(claude.chars_resposta, 300); // 100 + 200
+        assert_eq!(claude.chars_total(), 330);
+        assert_eq!(claude.tokens_estimados(), 82); // 330 / 4
+                                                   // O ollama do formato antigo não moveu volume registrado (fica 0).
+        assert_eq!(r.por_provedor["ollama_local"].chars_total(), 0);
+        // Totais agregados.
+        assert_eq!(r.total_chars_entrada(), 30);
+        assert_eq!(r.total_chars_resposta(), 300);
+        assert_eq!(r.total_chars(), 330);
+
+        // O relatório em texto mostra a seção de volume com o claude e o total.
+        let texto = format!("{r}");
+        assert!(texto.contains("-- volume (caracteres processados) --"));
+        assert!(texto.contains("- claude: 330 chars (entrada 30, resposta 300) ~82 tokens"));
+        assert!(texto.contains("volume total: 330 chars (entrada 30, resposta 300)"));
+    }
+
+    #[test]
+    fn sem_volume_a_secao_nao_aparece() {
+        // Só logs antigos (sem volume): a seção de volume some, mantendo o relatório enxuto.
+        let log =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
+        let r = agregar(log);
+        assert!(r.secao_volume().is_none());
+        assert!(!format!("{r}").contains("volume"));
+    }
+
+    #[test]
+    fn json_traz_volume_por_provedor_e_no_topo() {
+        let log = "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms (entrada ~10 chars, resposta ~100 chars)\n";
+        let valor = agregar(log).para_json(&BTreeMap::new());
+        // Topo: volume agregado.
+        assert_eq!(
+            valor.obter("chars_entrada").unwrap().como_numero(),
+            Some(10.0)
+        );
+        assert_eq!(
+            valor.obter("chars_resposta").unwrap().como_numero(),
+            Some(100.0)
+        );
+        // Por provedor: entrada, resposta e tokens estimados.
+        let claude = valor.obter("provedores").unwrap().obter("claude").unwrap();
+        assert_eq!(
+            claude.obter("chars_entrada").unwrap().como_numero(),
+            Some(10.0)
+        );
+        assert_eq!(
+            claude.obter("chars_resposta").unwrap().como_numero(),
+            Some(100.0)
+        );
+        assert_eq!(
+            claude.obter("tokens_estimados").unwrap().como_numero(),
+            Some(27.0) // 110 / 4
+        );
     }
 
     #[test]
