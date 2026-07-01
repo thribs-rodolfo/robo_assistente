@@ -267,13 +267,48 @@ impl Provedor for ProvedorClaudeCli {
 }
 
 // --------------------------------------------------------------------------- //
-// Provedores remotos via HTTPS: Groq (API estilo OpenAI) e Gemini (REST).
+// Provedores estilo OpenAI (`/chat/completions`) e Gemini (REST).
 //
-// Transporte: o módulo `https` (via curl). Pré-checagem exige `habilitado` + `chave`.
-// Ficam DESABILITADOS na config por enquanto, pois dependem de chave externa (o Thiago
-// cria a do Groq grátis; a do Gemini estava sem cota). O código está pronto: basta pôr a
-// chave e `"habilitado": true`. Sem sucesso falso — qualquer erro vira FalhaProvedor.
+// O `openai_compat` cobre DOIS mundos com o mesmo código, escolhendo o transporte pelo
+// esquema da URL configurada em `url_base`:
+//   • `https://...`  → serviço EXTERNO na nuvem (Groq, OpenAI, OpenRouter...). Vai pelo
+//     módulo `https` (curl/TLS) e EXIGE `chave` de API. Fica desabilitado até haver chave
+//     (o Thiago cria a do Groq grátis; a do Gemini estava sem cota).
+//   • `http://...`   → servidor LOCAL self-hosted que fala a mesma API (llama.cpp `--server`,
+//     LM Studio, vLLM, LocalAI, ou o próprio Ollama em `/v1`). Vai pelo NOSSO cliente cru
+//     `http` (TcpStream, sem TLS, zero deps) e NÃO precisa de chave — roda na máquina de
+//     confiança. Isso dá ao robô um SEGUNDO provedor local (redundância perto do piso) sem
+//     depender de nenhuma assinatura externa — exatamente o "agnosticismo" do projeto.
+// Em ambos os casos: sem sucesso falso — qualquer erro vira FalhaProvedor.
 // --------------------------------------------------------------------------- //
+
+/// Verdadeiro se a URL usa o esquema HTTPS (serviço externo, exige TLS/curl e chave).
+/// Comparação sem diferenciar maiúsculas, pois esquemas de URL são case-insensitive
+/// (RFC 3986). `get(..8)` evita fatiar fora de fronteira de caractere (nunca faz panic).
+/// `pub(crate)` para o doutor de config (`verificacao`) reusar a MESMA regra (DRY).
+pub(crate) fn url_e_https(url: &str) -> bool {
+    let inicio = url.trim_start();
+    inicio
+        .get(..8)
+        .is_some_and(|prefixo| prefixo.eq_ignore_ascii_case("https://"))
+}
+
+/// Envia o POST OpenAI-compat escolhendo o transporte pelo esquema da URL: `https://`
+/// pela pilha TLS (`https`/curl, externo); qualquer outra coisa pelo cliente cru `http`
+/// (TcpStream, local). Mesma assinatura nos dois módulos, então só trocamos qual chamar.
+fn enviar_openai_compat(
+    url: &str,
+    corpo_json: &str,
+    cabecalhos_extra: &[(&str, &str)],
+    tempo_limite: Duration,
+) -> Result<crate::http::RespostaHttp, FalhaProvedor> {
+    if url_e_https(url) {
+        https::post_json(url, corpo_json, cabecalhos_extra, tempo_limite)
+    } else {
+        http::post_json(url, corpo_json, cabecalhos_extra, tempo_limite)
+    }
+}
+
 struct ProvedorOpenAiCompat {
     config: ConfigProvedor,
 }
@@ -287,8 +322,18 @@ impl Provedor for ProvedorOpenAiCompat {
         if !self.config.habilitado {
             return Err(FalhaProvedor::Indisponivel("desabilitado na config".into()));
         }
-        if self.config.chave.as_deref().unwrap_or("").is_empty() {
-            return Err(FalhaProvedor::Indisponivel("sem chave de API".into()));
+        let url = self.config.url_base.as_deref().unwrap_or("");
+        if url.is_empty() {
+            return Err(FalhaProvedor::Indisponivel(
+                "provedor sem 'url_base'".into(),
+            ));
+        }
+        // Serviço externo (https) PRECISA de chave para autenticar; um servidor local
+        // (http) roda na máquina de confiança e normalmente aceita sem chave nenhuma.
+        if url_e_https(url) && self.config.chave.as_deref().unwrap_or("").is_empty() {
+            return Err(FalhaProvedor::Indisponivel(
+                "provedor OpenAI-compat externo (https) sem chave de API".into(),
+            ));
         }
         Ok(())
     }
@@ -304,12 +349,10 @@ impl Provedor for ProvedorOpenAiCompat {
             .modelo
             .as_deref()
             .ok_or_else(|| FalhaProvedor::Indisponivel("provedor sem 'modelo'".into()))?;
-        let chave = self
-            .config
-            .chave
-            .as_deref()
-            .filter(|c| !c.is_empty())
-            .ok_or_else(|| FalhaProvedor::Indisponivel("sem chave de API".into()))?;
+        // A chave é OPCIONAL: obrigatória só para endpoint externo (https), onde a
+        // pré-checagem `disponivel` já a exigiu. Para um servidor local (http) ela pode
+        // faltar — aí não mandamos cabeçalho de autorização.
+        let chave = self.config.chave.as_deref().filter(|c| !c.is_empty());
 
         let url = format!("{}/chat/completions", url_base.trim_end_matches('/'));
 
@@ -329,13 +372,14 @@ impl Provedor for ProvedorOpenAiCompat {
         ])
         .para_texto();
 
-        let autorizacao = format!("Bearer {chave}");
-        let resposta = https::post_json(
-            &url,
-            &corpo,
-            &[("Authorization", autorizacao.as_str())],
-            self.config.timeout,
-        )?;
+        // Só anexa `Authorization: Bearer <chave>` quando há chave (endpoint externo).
+        // O `autorizacao` precisa viver até o fim da chamada, por isso fica em variável.
+        let autorizacao = chave.map(|c| format!("Bearer {c}"));
+        let mut cabecalhos: Vec<(&str, &str)> = Vec::new();
+        if let Some(valor) = autorizacao.as_deref() {
+            cabecalhos.push(("Authorization", valor));
+        }
+        let resposta = enviar_openai_compat(&url, &corpo, &cabecalhos, self.config.timeout)?;
         if resposta.status != 200 {
             return Err(FalhaProvedor::Http {
                 status: resposta.status,
@@ -595,13 +639,53 @@ mod testes {
     }
 
     #[test]
-    fn groq_sem_chave_fica_indisponivel() {
-        let provedor = construir(&config_de("openai_compat", true)).unwrap();
-        // Sem chave -> indisponível (mensagem clara, nunca sucesso silencioso).
+    fn openai_compat_externo_https_sem_chave_fica_indisponivel() {
+        // URL https = serviço externo (Groq/OpenAI): sem chave -> indisponível (mensagem
+        // clara, nunca sucesso silencioso). Este é o estado ESPERADO do Groq hoje.
+        let mut config = config_de("openai_compat", true);
+        config.url_base = Some("https://api.groq.com/openai/v1".into());
+        config.chave = None;
+        let provedor = construir(&config).unwrap();
         assert!(matches!(
             provedor.disponivel(),
             Err(FalhaProvedor::Indisponivel(_))
         ));
+    }
+
+    #[test]
+    fn openai_compat_local_http_sem_chave_fica_disponivel() {
+        // URL http = servidor LOCAL self-hosted (llama.cpp/LM Studio/vLLM): NÃO precisa de
+        // chave, então fica DISPONÍVEL mesmo sem `chave` na config. É o novo caminho local.
+        let mut config = config_de("openai_compat", true);
+        config.url_base = Some("http://127.0.0.1:8080/v1".into());
+        config.chave = None;
+        let provedor = construir(&config).unwrap();
+        assert!(provedor.disponivel().is_ok());
+    }
+
+    #[test]
+    fn openai_compat_sem_url_base_fica_indisponivel() {
+        // Sem url_base não há para onde mandar: indisponível já na pré-checagem.
+        let mut config = config_de("openai_compat", true);
+        config.url_base = None;
+        let provedor = construir(&config).unwrap();
+        assert!(matches!(
+            provedor.disponivel(),
+            Err(FalhaProvedor::Indisponivel(_))
+        ));
+    }
+
+    #[test]
+    fn url_e_https_reconhece_esquema_sem_diferenciar_maiuscula() {
+        assert!(url_e_https("https://api.groq.com"));
+        assert!(url_e_https("HTTPS://API.GROQ.COM"));
+        assert!(url_e_https("  https://com-espaco-antes"));
+        assert!(!url_e_https("http://127.0.0.1:8080"));
+        assert!(!url_e_https("HTTP://local"));
+        assert!(!url_e_https(""));
+        assert!(!url_e_https("ftp://x"));
+        // Não faz panic com multibyte curto no começo (get(..8) devolve None).
+        assert!(!url_e_https("háçã"));
     }
 
     // ----------------------------------------------------------------------- //

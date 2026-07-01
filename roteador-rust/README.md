@@ -90,6 +90,31 @@ Mora **fora do repositório**, com as chaves reais, em
 
 O bloco `disjuntor` é **opcional** e vem **desligado por padrão** (ver abaixo).
 
+### Provedor `openai_compat`: nuvem (https) OU servidor local (http)
+
+O tipo `openai_compat` (endpoint estilo OpenAI, `POST /chat/completions`) cobre **dois
+mundos** com o mesmo código, escolhendo o transporte pelo **esquema da `url_base`**:
+
+| `url_base` | Transporte | Chave | Exemplo |
+|---|---|---|---|
+| `https://…` | `https` (curl/TLS) | **obrigatória** | Groq, OpenAI, OpenRouter |
+| `http://…`  | `http` (TcpStream cru, zero deps) | **opcional** | llama.cpp `--server`, LM Studio, vLLM, LocalAI, Ollama em `/v1` |
+
+Um servidor OpenAI-compatível **rodando na própria máquina** (http) é confiável e
+normalmente aceita requisição **sem chave** — então basta apontar a `url_base` para ele:
+
+```json
+"modelo_local": {"tipo": "openai_compat", "url_base": "http://127.0.0.1:8080/v1",
+                 "modelo": "meu-modelo", "timeout_segundos": 60, "habilitado": true}
+```
+
+Isso dá ao robô um **segundo provedor local** além do Ollama nativo (mais redundância perto
+do piso), **sem depender de nenhuma assinatura externa** — exatamente o "agnosticismo" do
+projeto. Quando a `url_base` é `https://`, o comportamento é o de sempre: TLS via curl e
+chave de API obrigatória (a pré-checagem `disponivel()` pula o provedor se faltar). A
+verificação estática (`bin/verificar-config`) entende essa distinção: `openai_compat` local
+(http) habilitado **sem** chave é uso normal (sem aviso); só `https` sem chave é sinalizado.
+
 Campo opcional `"telemetria_log"`: caminho do log de telemetria. Ausente → o log de
 produção (`/var/log/roteador-provedores.log`). Existe para NÃO haver um caminho global
 escondido: os testes apontam para um arquivo temporário e o roteamento fica **hermético**
@@ -603,7 +628,7 @@ checa:
 | tipo de provedor desconhecido | erro |
 | campo obrigatório faltando (ollama sem `url_base`/`modelo`, `resposta_fixa` sem `mensagem_fixa`, etc.) | erro |
 | **piso (último) desabilitado** | erro |
-| **piso do tipo que exige chave** (openai_compat/gemini_rest) | erro |
+| **piso do tipo que exige chave externa** (`gemini_rest`, ou `openai_compat` com `url_base` https) | erro |
 | piso do tipo que não é `ollama`/`resposta_fixa` (ex.: claude como último) | aviso |
 | nome repetido na ordem | aviso |
 | provedor declarado fora da ordem (nunca usado) | aviso |

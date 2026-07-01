@@ -59,7 +59,7 @@ fn provedor_fora_da_ordem_sai_zero_com_aviso() {
         r#"{"ordem_fallback":["claude","ollama_local"],
             "provedores":{
                 "claude":{"tipo":"claude_cli"},
-                "groq":{"tipo":"openai_compat","url_base":"http://x","modelo":"m"},
+                "groq":{"tipo":"openai_compat","url_base":"https://api.groq.com/openai/v1","modelo":"m"},
                 "gemini":{"tipo":"gemini_rest","modelo":"m"},
                 "ollama_local":{"tipo":"ollama","url_base":"http://127.0.0.1:11434","modelo":"qwen2.5:1.5b"}
             }}"#,
@@ -82,7 +82,7 @@ fn piso_inseguro_sai_um() {
         r#"{"ordem_fallback":["claude","groq"],
             "provedores":{
                 "claude":{"tipo":"claude_cli"},
-                "groq":{"tipo":"openai_compat","url_base":"http://x","modelo":"m","habilitado":true}
+                "groq":{"tipo":"openai_compat","url_base":"https://api.groq.com/openai/v1","modelo":"m","habilitado":true}
             }}"#,
     );
     let (codigo, stdout) = rodar(&caminho);

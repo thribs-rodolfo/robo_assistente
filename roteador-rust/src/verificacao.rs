@@ -69,12 +69,20 @@ impl fmt::Display for Achado {
     }
 }
 
-/// Tipos cujo provedor DEPENDE de uma chave de API externa: sem chave, a pré-checagem
-/// `disponivel()` já os pula em toda mensagem. Espelha a lógica de `disponivel()` de
-/// `ProvedorOpenAiCompat`/`ProvedorGeminiRest` (ver [`crate::provedor`]). Um provedor
-/// assim NÃO serve de piso: o piso não pode depender de chave/cota que pode faltar.
-fn tipo_exige_chave(tipo: &str) -> bool {
-    matches!(tipo, "openai_compat" | "gemini_rest")
+/// Um provedor DEPENDE de chave de API externa quando falaria com um serviço na nuvem que
+/// exige autenticação — sem chave, a pré-checagem `disponivel()` já o pula em toda mensagem
+/// e ele NÃO serve de piso (o piso não pode depender de chave/cota que pode faltar).
+///
+/// Espelha a lógica de `disponivel()` de `ProvedorOpenAiCompat`/`ProvedorGeminiRest`
+/// (ver [`crate::provedor`]): `gemini_rest` é sempre externo (URL fixa https); já
+/// `openai_compat` depende da URL — `https://` é externo (exige chave), `http://` é um
+/// servidor LOCAL self-hosted (llama.cpp/LM Studio/vLLM...) que não precisa de chave.
+fn exige_chave_externa(tipo: &str, url_base: Option<&str>) -> bool {
+    match tipo {
+        "gemini_rest" => true,
+        "openai_compat" => url_base.is_some_and(crate::provedor::url_e_https),
+        _ => false,
+    }
 }
 
 /// Verifica a config e devolve todos os achados (vazio = tudo certo).
@@ -194,7 +202,7 @@ pub fn verificar(config: &Config) -> Vec<Achado> {
         // Habilitado + exige chave + sem chave: o roteador o pula em toda mensagem. É o
         // estado ESPERADO do Groq/Gemini hoje (sem chave), por isso é aviso, não erro.
         if provedor_config.habilitado
-            && tipo_exige_chave(&provedor_config.tipo)
+            && exige_chave_externa(&provedor_config.tipo, provedor_config.url_base.as_deref())
             && sem(&provedor_config.chave)
         {
             achados.push(Achado::aviso(format!(
@@ -214,7 +222,7 @@ pub fn verificar(config: &Config) -> Vec<Achado> {
                     "piso '{nome_piso}' (último da ordem) está DESABILITADO: se toda a cadeia falhar, o robô fica mudo"
                 )));
             }
-            if tipo_exige_chave(&piso.tipo) {
+            if exige_chave_externa(&piso.tipo, piso.url_base.as_deref()) {
                 achados.push(Achado::erro(format!(
                     "piso '{nome_piso}' é do tipo '{}', que EXIGE chave externa: o piso não pode depender de chave/cota — use o Ollama local como último da ordem",
                     piso.tipo
@@ -340,15 +348,31 @@ mod testes {
 
     #[test]
     fn piso_que_exige_chave_e_erro() {
-        // Groq (openai_compat) como ÚLTIMO da ordem: depende de chave/cota → não serve de piso.
+        // Groq (openai_compat EXTERNO, https) como ÚLTIMO da ordem: depende de chave/cota →
+        // não serve de piso. O esquema https é o que marca "externo, exige chave".
         let achados = verificar_json(
             r#"{"ordem_fallback":["groq"],
-                "provedores":{"groq":{"tipo":"openai_compat","url_base":"http://x","modelo":"m","chave":"k","habilitado":true}}}"#,
+                "provedores":{"groq":{"tipo":"openai_compat","url_base":"https://api.groq.com/openai/v1","modelo":"m","chave":"k","habilitado":true}}}"#,
         );
         assert!(tem_erro(&achados));
         assert!(achados
             .iter()
             .any(|a| a.mensagem.contains("EXIGE chave") && a.mensagem.contains("piso")));
+    }
+
+    #[test]
+    fn piso_openai_compat_local_http_nao_exige_chave() {
+        // Um servidor OpenAI-compat LOCAL (http) como último NÃO dispara o erro "EXIGE
+        // chave" (não depende de chave externa). Ainda leva o AVISO de não ser
+        // ollama/resposta_fixa (não é garantidamente-vivo), mas não é ERRO de chave.
+        let achados = verificar_json(
+            r#"{"ordem_fallback":["local"],
+                "provedores":{"local":{"tipo":"openai_compat","url_base":"http://127.0.0.1:8080/v1","modelo":"m","habilitado":true}}}"#,
+        );
+        assert!(!achados.iter().any(|a| a.mensagem.contains("EXIGE chave")));
+        assert!(achados
+            .iter()
+            .any(|a| a.mensagem.contains("piso") && a.mensagem.contains("não 'ollama'")));
     }
 
     #[test]
@@ -394,11 +418,12 @@ mod testes {
 
     #[test]
     fn habilitado_sem_chave_e_aviso() {
-        // Groq habilitado sem chave, MAS não é o piso (Ollama é) → só aviso, sem erro.
+        // Groq (externo, https) habilitado sem chave, MAS não é o piso (Ollama é) → só
+        // aviso, sem erro. O https é o que o marca como externo que exige chave.
         let achados = verificar_json(
             r#"{"ordem_fallback":["groq","ollama_local"],
                 "provedores":{
-                    "groq":{"tipo":"openai_compat","url_base":"http://x","modelo":"m","habilitado":true},
+                    "groq":{"tipo":"openai_compat","url_base":"https://api.groq.com/openai/v1","modelo":"m","habilitado":true},
                     "ollama_local":{"tipo":"ollama","url_base":"http://y","modelo":"m"}
                 }}"#,
         );
@@ -406,6 +431,23 @@ mod testes {
         assert!(achados
             .iter()
             .any(|a| a.mensagem.contains("'groq'") && a.mensagem.contains("sem 'chave'")));
+    }
+
+    #[test]
+    fn openai_compat_local_http_habilitado_sem_chave_nao_avisa() {
+        // Servidor OpenAI-compat LOCAL (http) habilitado sem chave é uso NORMAL (não precisa
+        // de chave): não deve gerar o aviso "habilitado mas sem 'chave'".
+        let achados = verificar_json(
+            r#"{"ordem_fallback":["local","ollama_local"],
+                "provedores":{
+                    "local":{"tipo":"openai_compat","url_base":"http://127.0.0.1:8080/v1","modelo":"m","habilitado":true},
+                    "ollama_local":{"tipo":"ollama","url_base":"http://y","modelo":"m"}
+                }}"#,
+        );
+        assert!(!tem_erro(&achados));
+        assert!(!achados
+            .iter()
+            .any(|a| a.mensagem.contains("'local'") && a.mensagem.contains("sem 'chave'")));
     }
 
     #[test]
