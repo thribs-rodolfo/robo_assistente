@@ -53,12 +53,14 @@ e citar o nome na `ordem_fallback`.
 | `metricas.rs`   | Lê o log e agrega: de quem o robô realmente depende             |
 | `alerta.rs`     | Decide (função pura) quando avisar o Thiago que caiu no piso    |
 | `duracao.rs`    | Converte durações legíveis ("24h", "90m") <-> segundos          |
+| `verificacao.rs`| Doutor ESTÁTICO da config (piso, ordem, chaves) — funções puras |
 | `lib.rs`        | `rotear()` — a cadeia de fallback                               |
 | `servidor_http.rs` | Servidor HTTP/1.1 cru (parse de requisição + resposta)       |
 | `ponte.rs`      | Ponte Telegram: config dos bots, allowFrom, `sendMessage`, processar |
 | `bin/ponte-telegram` | Servidor de webhooks que liga o Telegram ao `rotear()`     |
 | `bin/metricas`  | Lê o log de telemetria e imprime as métricas (só leitura)       |
 | `bin/alerta`    | Avisa o Thiago quando o robô cai no piso (Ollama) N vezes seguidas |
+| `bin/verificar-config` | Confere a config antes do deploy (só leitura, nunca dispara provedor) |
 
 ## Config
 
@@ -247,6 +249,53 @@ No cron (`/root/alerta-piso-roteador.sh`, a cada 30min): `alerta --limite 5 --ja
 (os defaults de percentual entram automaticamente). Os limites são conservadores de propósito:
 só incomodam o Thiago quando a degradação é clara — em série **ou** em fração alta.
 
+## Verificar config (`bin/verificar-config`)
+
+Toda a garantia do projeto — "o robô **nunca fica mudo** porque o piso (Ollama local)
+responde quando o resto falha" — depende de uma config bem-formada. Se alguém desabilita o
+piso, tira ele da ordem, põe um provedor que exige chave como último, ou cita na
+`ordem_fallback` um nome inexistente, a garantia **quebra em silêncio**: só se descobre em
+produção, quando a cadeia inteira cai e o `rotear()` devolve `TodosFalharam` — com o bot vivo
+e o usuário mudo.
+
+O `bin/verificar-config` pega essa classe de erro **antes do deploy**. Roda a verificação
+estática (funções puras de `verificacao.rs`) sobre a config já parseada: **nenhuma rede,
+nenhum processo, nenhum provedor construído para valer** — 100% seguro (jamais toca o Claude).
+
+```sh
+verificar-config                        # confere o arquivo padrão (/root/.secrets/…)
+verificar-config /tmp/outra-config.json # confere outro arquivo
+```
+
+Distingue dois graus: **❌ ERRO** (quebra o roteamento ou a garantia do piso — precisa
+corrigir) e **⚠️ AVISO** (funciona, mas quase certamente é engano ou desperdício). O que ele
+checa:
+
+| Achado | Grau |
+| --- | --- |
+| `ordem_fallback` vazia | erro |
+| nome na ordem sem provedor declarado | erro |
+| tipo de provedor desconhecido | erro |
+| campo obrigatório faltando (ollama sem `url_base`/`modelo`, etc.) | erro |
+| **piso (último) desabilitado** | erro |
+| **piso do tipo que exige chave** (openai_compat/gemini_rest) | erro |
+| piso do tipo que não é `ollama` (ex.: claude como último) | aviso |
+| nome repetido na ordem | aviso |
+| provedor declarado fora da ordem (nunca usado) | aviso |
+| provedor habilitado sem `chave` (será pulado sempre) | aviso |
+
+Saída de processo: **0** sem erros (pode ter avisos), **1** com pelo menos um erro (ou falha
+ao ler/parsear). Útil em cron/CI: `verificar-config && deploy`. Exemplo contra uma config
+quebrada:
+
+```
+❌ ERRO   'fantasma' está na ordem_fallback mas não foi declarado em 'provedores'
+❌ ERRO   provedor 'xpto': tipo 'inventado' desconhecido (o roteador vai pular sempre)
+❌ ERRO   piso 'ollama_local' (último da ordem) está DESABILITADO: se toda a cadeia falhar, o robô fica mudo
+
+Resumo: 3 erros e 1 aviso.
+```
+
 ## Ponte Telegram (`bin/ponte-telegram`)
 
 Substitui o `servidor.py`. É o **lado servidor** da ponte: o Telegram entrega webhooks
@@ -299,6 +348,7 @@ cargo test                                              # testes unitários (pur
 cargo test --test integracao_ollama -- --ignored        # teste AO VIVO contra o Ollama local
 cargo clippy --all-targets -- -D warnings               # lint estrito, zero warning
 cargo fmt --check                                        # formatação
+verificar-config                                        # confere a config de produção antes do deploy
 ```
 
 > O teste ao vivo usa **só** o Ollama (a ordem não inclui o Claude), de propósito: nunca

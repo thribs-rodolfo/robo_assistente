@@ -33,6 +33,11 @@ path = "src/bin/metricas.rs"
 name = "alerta"
 path = "src/bin/alerta.rs"
 
+# Verificar-config: doutor estático da config (piso, ordem, chaves) — só leitura, nunca dispara provedor.
+[[bin]]
+name = "verificar-config"
+path = "src/bin/verificar_config.rs"
+
 # Linters estritos: build limpo, zero warning (cargo clippy -D warnings).
 [lints.rust]
 unsafe_code = "forbid"

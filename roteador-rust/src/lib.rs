@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod provedor;
 pub mod servidor_http;
 pub mod telemetria;
+pub mod verificacao;
 
 pub use config::{carregar_de_arquivo, Config, CAMINHO_PADRAO};
 pub use erro::{ErroRoteador, FalhaProvedor};
