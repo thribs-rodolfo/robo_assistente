@@ -33,13 +33,16 @@ impl Contexto {
     }
 }
 
-/// Monta um prompt em texto único: usado por provedores que recebem um campo `prompt`
-/// (Ollama) ou um único bloco de texto (Gemini). Concatena sistema + histórico + mensagem.
-pub fn montar_prompt(mensagem: &str, contexto: &Contexto) -> String {
+/// Monta só a CONVERSA (histórico + mensagem atual), SEM a instrução de sistema.
+///
+/// Serve aos provedores que têm um campo DEDICADO para a persona/sistema — o Ollama
+/// `/api/generate` aceita um `system` próprio, separado do `prompt`. Passar a persona por
+/// esse campo (em vez de amassá-la junto com os turnos do usuário) melhora a aderência do
+/// modelo à instrução, o que importa especialmente no piso (qwen2.5:1.5b, modelo fraco no
+/// qual repousa a garantia "o robô nunca fica mudo"). O [`montar_prompt`] reusa isto e só
+/// prefixa o sistema, para os provedores que recebem um bloco de texto ÚNICO (Gemini).
+pub fn montar_conversa(mensagem: &str, contexto: &Contexto) -> String {
     let mut partes: Vec<String> = Vec::new();
-    if let Some(sistema) = &contexto.sistema {
-        partes.push(sistema.clone());
-    }
     for turno in &contexto.historico {
         let rotulo = match turno.autor {
             Autor::Usuario => "usuario",
@@ -49,6 +52,16 @@ pub fn montar_prompt(mensagem: &str, contexto: &Contexto) -> String {
     }
     partes.push(format!("usuario: {mensagem}"));
     partes.join("\n\n")
+}
+
+/// Monta um prompt em texto único: usado por provedores que recebem um bloco de texto só
+/// (Gemini). Concatena sistema + [`montar_conversa`] (histórico + mensagem).
+pub fn montar_prompt(mensagem: &str, contexto: &Contexto) -> String {
+    let conversa = montar_conversa(mensagem, contexto);
+    match &contexto.sistema {
+        Some(sistema) => format!("{sistema}\n\n{conversa}"),
+        None => conversa,
+    }
 }
 
 /// Um par (papel, conteúdo) no formato de mensagens estilo OpenAI/Chat.
@@ -102,6 +115,42 @@ mod testes {
         assert!(prompt.contains("Você é o Rodolfo."));
         assert!(prompt.contains("usuario: oi"));
         assert!(prompt.contains("usuario: tudo bem?"));
+    }
+
+    #[test]
+    fn conversa_nao_inclui_o_sistema() {
+        // A conversa carrega só histórico + mensagem; a persona vai pelo campo dedicado do
+        // provedor (Ollama `system`), então NÃO deve aparecer aqui — senão duplicaria.
+        let contexto = Contexto {
+            sistema: Some("Você é o Rodolfo.".into()),
+            historico: vec![Turno {
+                autor: Autor::Assistente,
+                texto: "olá".into(),
+            }],
+        };
+        let conversa = montar_conversa("tudo bem?", &contexto);
+        assert!(!conversa.contains("Você é o Rodolfo."));
+        assert!(conversa.contains("assistente: olá"));
+        assert!(conversa.contains("usuario: tudo bem?"));
+    }
+
+    #[test]
+    fn prompt_com_sistema_prefixa_a_conversa_sem_duplicar() {
+        // O prompt de texto único (Gemini) é sistema + conversa, com o sistema aparecendo
+        // UMA vez só (no início) e a conversa logo em seguida.
+        let contexto = Contexto {
+            sistema: Some("SIS".into()),
+            historico: vec![],
+        };
+        let prompt = montar_prompt("oi", &contexto);
+        assert_eq!(prompt, "SIS\n\nusuario: oi");
+        assert_eq!(prompt.matches("SIS").count(), 1);
+    }
+
+    #[test]
+    fn prompt_sem_sistema_e_so_a_conversa() {
+        let contexto = Contexto::vazio();
+        assert_eq!(montar_prompt("oi", &contexto), "usuario: oi");
     }
 
     #[test]

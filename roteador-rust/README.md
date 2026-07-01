@@ -45,7 +45,7 @@ e citar o nome na `ordem_fallback`.
 | `json.rs`       | JSON próprio (parse + encode), com testes                       |
 | `http.rs`       | HTTP/1.1 cru sobre TcpStream (sem TLS), com timeouts + decodifica `chunked` |
 | `https.rs`      | HTTPS via `curl` (binário externo), espelha a interface do http |
-| `prompt.rs`     | Monta prompt/mensagens a partir de (mensagem, contexto)         |
+| `prompt.rs`     | Monta prompt/mensagens/conversa a partir de (mensagem, contexto) |
 | `erro.rs`       | Erros tipados: `FalhaProvedor`, `ErroRoteador`                  |
 | `config.rs`     | Lê a config JSON dos provedores (fora do repo)                  |
 | `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini, resposta fixa |
@@ -89,6 +89,18 @@ Mora **fora do repositório**, com as chaves reais, em
 ```
 
 O bloco `disjuntor` é **opcional** e vem **desligado por padrão** (ver abaixo).
+
+### Provedor Ollama: persona pelo campo `system` nativo
+
+O piso (Ollama, `qwen2.5:1.5b`) é o modelo **mais fraco** da cadeia, e toda a garantia "o
+robô nunca fica mudo" repousa nele. A `/api/generate` do Ollama tem um campo **`system`
+dedicado** para a persona/instrução, separado do `prompt`. O provedor passa a persona por
+esse campo (via `corpo_ollama`, função pura testável) e manda no `prompt` **só a conversa**
+(`prompt::montar_conversa` — histórico + mensagem), em vez de amassar tudo num texto único.
+Modelos pequenos **aderem melhor** à instrução quando ela vem no campo certo, e a persona
+**não se duplica** dentro do prompt. Sem `sistema` na config (ou vazio), o campo `system`
+nem é enviado — corpo idêntico ao formato antigo (retrocompatível). Provedores que só aceitam
+um bloco de texto (Gemini) seguem usando `prompt::montar_prompt` = sistema + conversa.
 
 ### Provedor `openai_compat`: nuvem (https) OU servidor local (http)
 

@@ -60,6 +60,32 @@ struct ProvedorOllama {
     config: ConfigProvedor,
 }
 
+/// Monta o corpo JSON do `/api/generate` do Ollama: `{"model", "prompt", "stream", ["system"]}`.
+///
+/// Função PURA (sem rede) para ser testável sozinha. A persona vai pelo campo NATIVO
+/// `system` do Ollama — separado da conversa — em vez de amassada dentro do `prompt`. Isso
+/// deixa o modelo pequeno (qwen2.5:1.5b) aderir melhor à instrução, sem duplicá-la: o
+/// `prompt` carrega só a CONVERSA ([`prompt::montar_conversa`]). Sem `sistema` na config
+/// (ou vazio), o campo `system` nem é enviado — corpo idêntico ao formato antigo.
+fn corpo_ollama(modelo: &str, mensagem: &str, contexto: &Contexto) -> String {
+    let mut campos = vec![
+        ("model".to_string(), Valor::Texto(modelo.to_string())),
+        (
+            "prompt".to_string(),
+            Valor::Texto(prompt::montar_conversa(mensagem, contexto)),
+        ),
+        ("stream".to_string(), Valor::Booleano(false)),
+    ];
+    // Só manda `system` quando há persona de fato (não-vazia): mantém o corpo enxuto e
+    // igual ao antigo quando não há instrução de sistema.
+    if let Some(sistema) = contexto.sistema.as_deref().map(str::trim) {
+        if !sistema.is_empty() {
+            campos.push(("system".to_string(), Valor::Texto(sistema.to_string())));
+        }
+    }
+    Valor::Objeto(campos).para_texto()
+}
+
 impl Provedor for ProvedorOllama {
     fn nome(&self) -> &str {
         &self.config.nome
@@ -86,16 +112,7 @@ impl Provedor for ProvedorOllama {
 
         let url = format!("{}/api/generate", url_base.trim_end_matches('/'));
 
-        // Monta o corpo {"model":..., "prompt":..., "stream": false} com nosso JSON próprio.
-        let corpo = Valor::Objeto(vec![
-            ("model".into(), Valor::Texto(modelo.to_string())),
-            (
-                "prompt".into(),
-                Valor::Texto(prompt::montar_prompt(mensagem, contexto)),
-            ),
-            ("stream".into(), Valor::Booleano(false)),
-        ])
-        .para_texto();
+        let corpo = corpo_ollama(modelo, mensagem, contexto);
 
         let resposta = http::post_json(&url, &corpo, &[], self.config.timeout)?;
         if resposta.status != 200 {
@@ -564,6 +581,59 @@ mod testes {
             habilitado,
             retentativas: 0,
             retentativa_espera_ms: 250,
+        }
+    }
+
+    #[test]
+    fn corpo_ollama_usa_campo_system_nativo_sem_duplicar_no_prompt() {
+        use crate::prompt::{Autor, Contexto, Turno};
+        let contexto = Contexto {
+            sistema: Some("Você é o Ronaldo.".into()),
+            historico: vec![Turno {
+                autor: Autor::Usuario,
+                texto: "oi".into(),
+            }],
+        };
+        let corpo = corpo_ollama("qwen2.5:1.5b", "tudo bem?", &contexto);
+        // Parseia de volta com nosso próprio JSON para inspecionar os campos.
+        let raiz = json::parsear(&corpo).unwrap();
+        // A persona vai no campo NATIVO `system`.
+        assert_eq!(
+            raiz.obter("system").and_then(Valor::como_texto),
+            Some("Você é o Ronaldo.")
+        );
+        // ...e NÃO se repete dentro do `prompt` (que carrega só a conversa).
+        let prompt = raiz.obter("prompt").and_then(Valor::como_texto).unwrap();
+        assert!(!prompt.contains("Você é o Ronaldo."));
+        assert!(prompt.contains("usuario: oi"));
+        assert!(prompt.contains("usuario: tudo bem?"));
+        assert_eq!(
+            raiz.obter("model").and_then(Valor::como_texto),
+            Some("qwen2.5:1.5b")
+        );
+    }
+
+    #[test]
+    fn corpo_ollama_sem_persona_nao_manda_campo_system() {
+        use crate::prompt::Contexto;
+        // Sem sistema (ou só espaços) o campo `system` nem aparece — corpo igual ao antigo.
+        for contexto in [
+            Contexto::vazio(),
+            Contexto {
+                sistema: Some("   ".into()),
+                historico: vec![],
+            },
+        ] {
+            let corpo = corpo_ollama("m", "oi", &contexto);
+            let raiz = json::parsear(&corpo).unwrap();
+            assert!(
+                raiz.obter("system").is_none(),
+                "não deve mandar system vazio"
+            );
+            assert_eq!(
+                raiz.obter("prompt").and_then(Valor::como_texto),
+                Some("usuario: oi")
+            );
         }
     }
 
