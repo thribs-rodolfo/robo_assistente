@@ -45,6 +45,20 @@ pub struct EstadoProvedor {
     pub aberto_ate: u64,
 }
 
+/// Uma linha do relatório de inspeção do disjuntor (o `bin/disjuntor`), já mastigada para
+/// exibição: não expõe o campo cru `aberto_ate` (epoch), e sim o que o operador quer ler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumoProvedor {
+    /// Nome lógico do provedor (ex.: `"claude"`).
+    pub nome: String,
+    /// Falhas seguidas acumuladas (sem sucesso no meio).
+    pub falhas_consecutivas: u32,
+    /// O circuito está aberto AGORA? (Aberto = o roteador pula este provedor.)
+    pub aberto: bool,
+    /// Quantos segundos faltam para o cooldown expirar (0 quando já está fechado/meio-aberto).
+    pub segundos_restantes: u64,
+}
+
 /// O estado do disjuntor para todos os provedores. Mapa nome->estado.
 ///
 /// Usamos `BTreeMap` (e não `HashMap`) de propósito: a ordem fica determinística, então a
@@ -102,6 +116,39 @@ impl EstadoDisjuntor {
             .get(nome)
             .map(|e| e.falhas_consecutivas)
             .unwrap_or(0)
+    }
+
+    /// Há ALGUM provedor com o circuito aberto agora? Para o inspetor decidir o código de
+    /// saída (0 = tudo fechado, 1 = algo pulando) sem repetir a varredura no chamador.
+    pub fn algum_aberto(&self, agora: u64) -> bool {
+        self.por_provedor
+            .values()
+            .any(|estado| agora < estado.aberto_ate)
+    }
+
+    /// Fotografa o estado de cada provedor conhecido para leitura humana (o `bin/disjuntor`).
+    ///
+    /// Função PURA sobre `(estado, agora)` → testável sem relógio/disco. Só aparecem os
+    /// provedores que têm ALGUMA falha recente registrada (o mapa já é enxuto: sucesso remove
+    /// a entrada). A ordem é determinística (o mapa é um `BTreeMap`), então a saída é estável.
+    pub fn resumo(&self, agora: u64) -> Vec<ResumoProvedor> {
+        self.por_provedor
+            .iter()
+            .map(|(nome, estado)| {
+                let aberto = agora < estado.aberto_ate;
+                ResumoProvedor {
+                    nome: nome.clone(),
+                    falhas_consecutivas: estado.falhas_consecutivas,
+                    aberto,
+                    // Só faz sentido falar em "restante" enquanto está aberto; fechado = 0.
+                    segundos_restantes: if aberto {
+                        estado.aberto_ate.saturating_sub(agora)
+                    } else {
+                        0
+                    },
+                }
+            })
+            .collect()
     }
 
     /// Serializa o estado como JSON (nosso próprio encoder). Formato:
@@ -347,6 +394,67 @@ mod testes {
         assert!(carregado.esta_aberto("claude", 5));
 
         let _ = std::fs::remove_file(&caminho);
+    }
+
+    #[test]
+    fn resumo_reflete_aberto_e_falhas() {
+        let cfg = config_teste(); // abre com 3 falhas, cooldown base 60
+        let mut estado = EstadoDisjuntor::vazio();
+
+        // "claude": 3 falhas em t=0 → aberto até 60 (restante 60 - agora).
+        for _ in 0..3 {
+            estado.apos_falha("claude", 0, &cfg);
+        }
+        // "gemini": 2 falhas (abaixo do limiar) → conhecido mas fechado.
+        estado.apos_falha("gemini", 0, &cfg);
+        estado.apos_falha("gemini", 0, &cfg);
+
+        // Em t=10: claude aberto (faltam 50s), gemini fechado com 2 falhas.
+        let resumo = estado.resumo(10);
+        // BTreeMap ordena por nome: claude antes de gemini.
+        assert_eq!(resumo.len(), 2);
+
+        assert_eq!(resumo[0].nome, "claude");
+        assert!(resumo[0].aberto);
+        assert_eq!(resumo[0].falhas_consecutivas, 3);
+        assert_eq!(resumo[0].segundos_restantes, 50);
+
+        assert_eq!(resumo[1].nome, "gemini");
+        assert!(!resumo[1].aberto);
+        assert_eq!(resumo[1].falhas_consecutivas, 2);
+        assert_eq!(resumo[1].segundos_restantes, 0);
+    }
+
+    #[test]
+    fn resumo_marca_meio_aberto_como_fechado_sem_restante() {
+        let cfg = config_teste();
+        let mut estado = EstadoDisjuntor::vazio();
+        for _ in 0..3 {
+            estado.apos_falha("claude", 0, &cfg); // aberto até 60
+        }
+        // Em t=60 o cooldown expirou: meio-aberto = não-aberto para o roteador, sem restante.
+        let resumo = estado.resumo(60);
+        assert!(!resumo[0].aberto);
+        assert_eq!(resumo[0].segundos_restantes, 0);
+        // Mas as falhas seguem contadas (é isso que reabre na hora se falhar de novo).
+        assert_eq!(resumo[0].falhas_consecutivas, 3);
+    }
+
+    #[test]
+    fn algum_aberto_detecta_circuito_aberto() {
+        let cfg = config_teste();
+        let mut estado = EstadoDisjuntor::vazio();
+        assert!(!estado.algum_aberto(0)); // vazio: nada aberto
+        for _ in 0..3 {
+            estado.apos_falha("claude", 0, &cfg);
+        }
+        assert!(estado.algum_aberto(59)); // dentro do cooldown
+        assert!(!estado.algum_aberto(60)); // expirou → nada mais aberto
+    }
+
+    #[test]
+    fn resumo_de_estado_vazio_e_vazio() {
+        assert!(EstadoDisjuntor::vazio().resumo(1_000).is_empty());
     }
 
     #[test]

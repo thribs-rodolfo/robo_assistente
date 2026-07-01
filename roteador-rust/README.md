@@ -63,6 +63,7 @@ e citar o nome na `ordem_fallback`.
 | `bin/alerta`    | Avisa o Thiago quando o robô cai no piso (Ollama) N vezes seguidas |
 | `bin/verificar-config` | Confere a config antes do deploy (só leitura, nunca dispara provedor) |
 | `bin/diagnostico` | Sonda se o piso (Ollama) está vivo com o modelo certo — nunca toca Claude |
+| `bin/disjuntor` | Inspeciona o estado do disjuntor: quais circuitos estão abertos (só leitura) |
 
 ## Config
 
@@ -136,6 +137,28 @@ passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabr
 Campos (todos opcionais, com padrão): `habilitado` (false), `limiar_falhas` (3),
 `cooldown_segundos` (60, cooldown BASE), `cooldown_maximo_segundos` (1800, teto do backoff),
 `caminho_estado` (`/var/log/roteador-disjuntor.estado`).
+
+### Inspecionar o disjuntor (`bin/disjuntor`)
+
+O estado do disjuntor vive num arquivo JSON opaco. Sem ver "quais circuitos estão abertos
+agora e por quanto tempo", **ligar o disjuntor em produção dá medo** — por isso ele ainda
+está desligado. O `bin/disjuntor` é o olho: lê a config (para achar o `caminho_estado`) e o
+arquivo de estado e mostra, por provedor, se está **aberto** (sendo pulado) com o restante do
+cooldown, ou fechado com quantas falhas já acumulou. É **só leitura**: nunca constrói
+provedor, nunca abre socket, **nunca dispara o Claude**.
+
+```
+$ disjuntor                      # config padrão em /root/.secrets/...
+== Disjuntor do roteador ==
+estado: LIGADO (abre com 3 falhas seguidas, cooldown base 1min)
+  🔴 claude: ABERTO (pulado) — reabre em 5min · 4 falha(s) seguida(s)
+  🟢 gemini: fechado (deixa passar) · 2 falha(s) acumulada(s)
+```
+
+Código de saída (para monitoramento/cron): `0` = nenhum circuito aberto, `1` = ao menos um
+provedor sendo pulado agora, `2` = erro de uso / config ilegível. Quando o disjuntor está
+**desligado** na config, o relatório avisa que as linhas são só resíduo (não afetam o
+roteamento).
 
 ## Retentativa em falhas transitórias (`retentativas`)
 
