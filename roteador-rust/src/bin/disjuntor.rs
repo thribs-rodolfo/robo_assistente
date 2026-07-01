@@ -147,6 +147,7 @@ mod testes {
     fn cfg_ligado() -> ConfigDisjuntor {
         ConfigDisjuntor {
             habilitado: true,
+            sombra: false,
             limiar_falhas: 3,
             cooldown_segundos: 60,
             cooldown_maximo_segundos: 600,

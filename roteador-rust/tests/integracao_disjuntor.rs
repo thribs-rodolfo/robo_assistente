@@ -61,6 +61,7 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
         ],
         disjuntor: ConfigDisjuntor {
             habilitado: true,
+            sombra: false,
             limiar_falhas: 2,
             cooldown_segundos: 3_600,
             cooldown_maximo_segundos: 86_400,

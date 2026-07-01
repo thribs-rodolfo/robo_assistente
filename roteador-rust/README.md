@@ -83,8 +83,8 @@ Mora **fora do repositório**, com as chaves reais, em
     "ollama_local": {"tipo": "ollama", "url_base": "http://127.0.0.1:11434",
                      "modelo": "qwen2.5:1.5b", "timeout_segundos": 180, "habilitado": true}
   },
-  "disjuntor": {"habilitado": false, "limiar_falhas": 3, "cooldown_segundos": 60,
-                "cooldown_maximo_segundos": 1800}
+  "disjuntor": {"habilitado": false, "sombra": false, "limiar_falhas": 3,
+                "cooldown_segundos": 60, "cooldown_maximo_segundos": 1800}
 }
 ```
 
@@ -134,9 +134,33 @@ passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabr
 - Telemetria: um pulo pelo disjuntor sai como `[disjuntor] <nome>: disjuntor aberto (N
   falhas seguidas) — pulando`.
 
-Campos (todos opcionais, com padrão): `habilitado` (false), `limiar_falhas` (3),
-`cooldown_segundos` (60, cooldown BASE), `cooldown_maximo_segundos` (1800, teto do backoff),
-`caminho_estado` (`/var/log/roteador-disjuntor.estado`).
+Campos (todos opcionais, com padrão): `habilitado` (false), `sombra` (false, ver abaixo),
+`limiar_falhas` (3), `cooldown_segundos` (60, cooldown BASE), `cooldown_maximo_segundos`
+(1800, teto do backoff), `caminho_estado` (`/var/log/roteador-disjuntor.estado`).
+
+### Modo sombra (`sombra: true`) — a rampa de confiança
+
+Ligar o disjuntor em produção **dá medo**: e se ele pular um provedor que na verdade ia
+responder? O modo **sombra** (dry-run) responde essa pergunta com **risco zero**. Com
+`{"habilitado": true, "sombra": true}`, o disjuntor **observa e aprende** (conta falhas,
+abre/fecha circuitos, grava estado) mas **NÃO pula ninguém** — o roteamento fica **idêntico
+ao de hoje**. Em vez de pular, ele só **registra na telemetria o que FARIA** se estivesse
+ativo, comparando a previsão com o que **realmente** aconteceu:
+
+- **Previsão certa** (pularia um provedor que de fato falhou):
+  `[disjuntor-sombra] pularia '<nome>' (circuito aberto, N falhas seguidas) e teria
+  economizado ~<ms>ms — ele falhou como previsto`. Esse `<ms>` é a latência REAL que o
+  provedor morto acabou de gastar — ou seja, exatamente o que o disjuntor ligado pouparia
+  naquela mensagem. É a economia virando número, medida no tráfego real.
+- **Falso positivo** (pularia um provedor que RESPONDEU):
+  `[disjuntor-sombra] PULARIA '<nome>' ... mas ele RESPONDEU em <ms>ms — FALSO POSITIVO`.
+  É o sinal de ouro: mostra que ligar o disjuntor agora custaria uma resposta boa → suba o
+  `limiar_falhas`/`cooldown` antes de ativar.
+
+Fluxo sugerido: rode um tempo com `sombra: true`, leia essas linhas (só `grep disjuntor-sombra`
+no log de telemetria), confira que só há previsões certas (sem falsos positivos) e a economia
+compensa — **então** troque para `sombra: false` e o disjuntor passa a pular de verdade. Sem
+efeito quando `habilitado: false`.
 
 ### Inspecionar o disjuntor (`bin/disjuntor`)
 

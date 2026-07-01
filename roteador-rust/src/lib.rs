@@ -109,16 +109,24 @@ pub fn rotear(
             continue;
         }
 
-        // Disjuntor: se o circuito deste provedor está ABERTO (vem falhando em série) e ele
-        // NÃO é o piso, pula sem gastar rede/processo — é justamente a latência que o
-        // disjuntor economiza quando um provedor de cima está fora do ar.
-        if usar_disjuntor && indice != indice_piso && estado_disjuntor.esta_aberto(nome, agora) {
+        // Disjuntor: o circuito deste provedor está ABERTO (vem falhando em série) e ele NÃO é
+        // o piso? O piso nunca é pulado — garante que o robô jamais fica mudo.
+        let circuito_aberto =
+            usar_disjuntor && indice != indice_piso && estado_disjuntor.esta_aberto(nome, agora);
+
+        // MODO ATIVO (sombra desligada): pula sem gastar rede/processo — é justamente a
+        // latência que o disjuntor economiza quando um provedor de cima está fora do ar.
+        if circuito_aberto && !config.disjuntor.sombra {
             let falhas = estado_disjuntor.falhas_de(nome);
             let motivo = format!("{nome}: disjuntor aberto ({falhas} falhas seguidas) — pulando");
             telemetria::registrar_em(&config.telemetria_log, &format!("[disjuntor] {motivo}"));
             motivos.push(motivo);
             continue;
         }
+        // MODO SOMBRA (`sombra: true`): se o circuito está aberto, NÃO pulamos — seguimos e
+        // tentamos o provedor de verdade (roteamento idêntico ao de hoje). O flag
+        // `circuito_aberto` fica guardado; depois da tentativa (nos ramos Ok/Err abaixo)
+        // comparamos "o que o disjuntor ATIVO faria" com o que REALMENTE aconteceu.
 
         // Tentativa real, com RE-tentativas em falhas TRANSITÓRIAS (blip de rede, 429, 5xx)
         // antes de cair pro próximo. Retentar no provedor bom evita jogar o robô no piso por
@@ -140,6 +148,18 @@ pub fn rotear(
                     &config.telemetria_log,
                     &format!("[ok] respondido por '{nome}' em {ms}ms"),
                 );
+                // Sombra: o disjuntor ATIVO teria PULADO este provedor, mas ele RESPONDEU. É um
+                // FALSO POSITIVO — ligar o disjuntor agora custaria esta resposta boa. Sinal de
+                // ouro para o Thiago decidir/afinar (subir limiar/cooldown) antes de ativar.
+                if circuito_aberto {
+                    let falhas = estado_disjuntor.falhas_de(nome);
+                    telemetria::registrar_em(
+                        &config.telemetria_log,
+                        &format!(
+                            "[disjuntor-sombra] PULARIA '{nome}' (circuito aberto, {falhas} falhas seguidas) mas ele RESPONDEU em {ms}ms — FALSO POSITIVO (não ligar ainda / afinar limiar)"
+                        ),
+                    );
+                }
                 // Sucesso fecha o circuito (provedor voltou a si) e persiste o estado.
                 if usar_disjuntor {
                     estado_disjuntor.apos_sucesso(nome);
@@ -156,6 +176,18 @@ pub fn rotear(
                     &config.telemetria_log,
                     &format!("[falha] {motivo} (após {ms}ms) — caindo pro próximo"),
                 );
+                // Sombra: o disjuntor ATIVO teria pulado, e o provedor de fato FALHOU — previsão
+                // CERTA. A latência que ele acabou de gastar ({ms}ms) é exatamente o que o
+                // disjuntor ligado teria economizado nesta mensagem. É a economia virando número.
+                if circuito_aberto {
+                    let falhas = estado_disjuntor.falhas_de(nome);
+                    telemetria::registrar_em(
+                        &config.telemetria_log,
+                        &format!(
+                            "[disjuntor-sombra] pularia '{nome}' (circuito aberto, {falhas} falhas seguidas) e teria economizado ~{ms}ms — ele falhou como previsto"
+                        ),
+                    );
+                }
                 // Registra a falha no disjuntor SÓ se ela indicar que o PROVEDOR está
                 // indisponível (rede/timeout/processo/401/429/5xx). Falha específica da
                 // mensagem (HTTP 400/404/413/422, resposta vazia/inválida) NÃO abre o
@@ -442,6 +474,7 @@ mod testes {
         let mut estado = EstadoDisjuntor::vazio();
         let cfg_dj = crate::config::ConfigDisjuntor {
             habilitado: true,
+            sombra: false,
             limiar_falhas: 3,
             cooldown_segundos: 100_000,
             cooldown_maximo_segundos: 1_000_000,
@@ -489,6 +522,78 @@ mod testes {
         }
 
         let _ = std::fs::remove_file(&caminho);
+    }
+
+    #[test]
+    fn modo_sombra_nao_pula_mas_registra_o_que_faria() {
+        use crate::disjuntor::EstadoDisjuntor;
+
+        // Estado com o 'topo' já ABERTO (falhando em série), igual ao teste do modo ativo.
+        let caminho = std::env::temp_dir().join("roteador-lib-sombra-teste.estado");
+        let caminho = caminho.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&caminho);
+        let mut estado = EstadoDisjuntor::vazio();
+        let cfg_dj = crate::config::ConfigDisjuntor {
+            habilitado: true,
+            sombra: true,
+            limiar_falhas: 3,
+            cooldown_segundos: 100_000,
+            cooldown_maximo_segundos: 1_000_000,
+            caminho_estado: caminho.clone(),
+        };
+        let agora_real = instante_epoch_segundos();
+        for _ in 0..3 {
+            estado.apos_falha("topo", agora_real, &cfg_dj);
+        }
+        estado.salvar(&caminho);
+
+        // Log de telemetria próprio (temporário) para inspecionar as linhas [disjuntor-sombra].
+        let log = std::env::temp_dir().join("roteador-lib-sombra.log");
+        let log = log.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&log);
+
+        // Mesma cadeia [topo, piso] em portas mortas, MAS com `sombra: true`. Diferença crucial
+        // vs. o modo ativo: o 'topo' NÃO é pulado — é tentado (e falha, porta morta).
+        let json = format!(
+            r#"{{
+                "ordem_fallback": ["topo", "piso"],
+                "provedores": {{
+                    "topo": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}},
+                    "piso": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}}
+                }},
+                "disjuntor": {{"habilitado": true, "sombra": true, "cooldown_segundos": 100000, "caminho_estado": "{caminho}"}},
+                "telemetria_log": "{log}"
+            }}"#
+        );
+        let config = interpretar(&json).unwrap();
+
+        match rotear("oi", &Contexto::vazio(), &config).unwrap_err() {
+            ErroRoteador::TodosFalharam(motivos) => {
+                assert_eq!(motivos.len(), 2, "topo TENTADO (não pulado) + piso tentado");
+                // O 'topo' foi tentado de verdade: o motivo é a falha real, NÃO "disjuntor pulando".
+                assert!(
+                    motivos[0].starts_with("topo:") && !motivos[0].contains("disjuntor aberto"),
+                    "no modo sombra o topo é tentado, não pulado; veio: {}",
+                    motivos[0]
+                );
+            }
+            outro => panic!("esperava TodosFalharam, veio {outro:?}"),
+        }
+
+        // A telemetria deve conter a linha da SOMBRA dizendo que PULARIA o topo e a economia.
+        let conteudo_log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            conteudo_log.contains("[disjuntor-sombra] pularia 'topo'"),
+            "faltou a linha de sombra no log; veio:\n{conteudo_log}"
+        );
+        // E NÃO deve conter a linha do modo ATIVO ("[disjuntor] ... pulando"): não pulou de fato.
+        assert!(
+            !conteudo_log.contains("[disjuntor] topo: disjuntor aberto"),
+            "sombra não pode emitir a linha de pulo real; veio:\n{conteudo_log}"
+        );
+
+        let _ = std::fs::remove_file(&caminho);
+        let _ = std::fs::remove_file(&log);
     }
 
     #[test]

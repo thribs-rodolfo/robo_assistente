@@ -271,6 +271,7 @@ mod testes {
     fn config_teste() -> ConfigDisjuntor {
         ConfigDisjuntor {
             habilitado: true,
+            sombra: false,
             limiar_falhas: 3,
             cooldown_segundos: 60,
             cooldown_maximo_segundos: 600,

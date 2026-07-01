@@ -59,6 +59,15 @@ pub struct ConfigProvedor {
 pub struct ConfigDisjuntor {
     /// Liga/desliga o disjuntor. Desligado, o roteador nem lê/grava o arquivo de estado.
     pub habilitado: bool,
+    /// Modo SOMBRA (dry-run): quando `true` (e `habilitado: true`), o disjuntor OBSERVA e
+    /// aprende (conta falhas, abre/fecha circuitos, grava estado) mas NÃO pula ninguém — o
+    /// roteamento fica IDÊNTICO ao de hoje. Em vez de pular, ele apenas REGISTRA na telemetria
+    /// o que FARIA se estivesse ativo (`[disjuntor-sombra] ...`), inclusive quanto de latência
+    /// teria economizado e — o mais valioso — quando ele PULARIA um provedor que na verdade
+    /// RESPONDEU (falso positivo). É a rampa de confiança para ligar o disjuntor de verdade:
+    /// dá para vê-lo decidir sobre tráfego real, com risco ZERO na ponte viva, antes de ativar.
+    /// Padrão `false` (quando ligado, já pula de verdade). Sem efeito com `habilitado: false`.
+    pub sombra: bool,
     /// Quantas falhas SEGUIDAS abrem o circuito de um provedor.
     pub limiar_falhas: u32,
     /// Por quantos segundos o circuito fica aberto (provedor pulado) antes do meio-aberto.
@@ -84,6 +93,7 @@ impl Default for ConfigDisjuntor {
         // com o backoff dobrando até um teto de 30 min (60→120→240→…→1800s).
         ConfigDisjuntor {
             habilitado: false,
+            sombra: false,
             limiar_falhas: 3,
             cooldown_segundos: 60,
             cooldown_maximo_segundos: 1_800,
@@ -180,6 +190,11 @@ fn interpretar_disjuntor(valor: Option<&Valor>) -> ConfigDisjuntor {
         .obter("habilitado")
         .and_then(Valor::como_booleano)
         .unwrap_or(padrao.habilitado);
+    // Modo sombra (dry-run): observa sem pular. Padrão false (quando ligado, pula de verdade).
+    let sombra = valor
+        .obter("sombra")
+        .and_then(Valor::como_booleano)
+        .unwrap_or(padrao.sombra);
     // Limiar mínimo 1: "0 falhas abrem" não faz sentido (abriria sem nunca tentar).
     let limiar_falhas = valor
         .obter("limiar_falhas")
@@ -205,6 +220,7 @@ fn interpretar_disjuntor(valor: Option<&Valor>) -> ConfigDisjuntor {
 
     ConfigDisjuntor {
         habilitado,
+        sombra,
         limiar_falhas,
         cooldown_segundos,
         cooldown_maximo_segundos,
@@ -369,6 +385,22 @@ mod testes {
         let g = config.provedor("g").unwrap();
         assert_eq!(g.retentativas, 3);
         assert_eq!(g.retentativa_espera_ms, 500);
+    }
+
+    #[test]
+    fn disjuntor_sombra_ausente_e_false_por_padrao() {
+        // Ligar o disjuntor sem citar `sombra` deve deixá-lo no modo ATIVO (pula de verdade).
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"disjuntor":{"habilitado":true}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(config.disjuntor.habilitado);
+        assert!(!config.disjuntor.sombra);
+    }
+
+    #[test]
+    fn disjuntor_sombra_e_lida_quando_presente() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"disjuntor":{"habilitado":true,"sombra":true}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(config.disjuntor.sombra);
     }
 
     #[test]
