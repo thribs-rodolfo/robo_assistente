@@ -29,7 +29,6 @@
 //! temporário.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 
 use crate::config::ConfigDisjuntor;
 use crate::json::{self, Valor};
@@ -225,13 +224,15 @@ impl EstadoDisjuntor {
     /// Grava o estado no arquivo (best-effort). Falha de escrita avisa no stderr mas não
     /// derruba o roteamento — pior caso, na próxima mensagem relemos o estado anterior.
     pub fn salvar(&self, caminho: &str) {
-        let resultado = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(caminho)
-            .and_then(|mut arquivo| arquivo.write_all(self.para_json().as_bytes()));
-        if let Err(erro) = resultado {
+        // Escrita ATÔMICA (temporário + rename): a ponte grava este estado em VÁRIAS threads
+        // (uma por mensagem — `bin/ponte-telegram` faz `thread::spawn` por conexão). Com a
+        // escrita ingênua (truncate + write), um leitor concorrente — outra thread de
+        // roteamento, o `bin/disjuntor` ou um cron — podia pegar o arquivo vazio/pela metade,
+        // e o `carregar` trataria como corrompido → "tudo fechado", esquecendo os circuitos
+        // abertos justo sob carga (o contrário do que o disjuntor deveria fazer). Ver
+        // [`crate::arquivo`]. Best-effort: falha de escrita avisa no stderr mas não derruba o
+        // roteamento — pior caso, na próxima mensagem relemos o estado anterior.
+        if let Err(erro) = crate::arquivo::escrever_atomico(caminho, self.para_json().as_bytes()) {
             eprintln!("[disjuntor] não consegui gravar estado em {caminho}: {erro}");
         }
     }

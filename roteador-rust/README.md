@@ -129,6 +129,13 @@ passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabr
   mensagem — não conta pro disjuntor`.
 - **Estado operacional e efêmero** em `/var/log/roteador-disjuntor.estado` (fora do repo);
   ausente/corrompido → tudo tratado como fechado (= comportamento antigo). Degrada com graça.
+- **Gravação ATÔMICA do estado** (temporário + `rename`, ver módulo `arquivo`): a ponte atende
+  cada mensagem numa thread própria, então dois roteamentos podem gravar este arquivo "ao mesmo
+  tempo". A escrita ingênua (truncate + write) deixa o arquivo vazio/pela metade por um instante,
+  e um leitor concorrente (outra thread, o `bin/disjuntor`, um cron) o veria "corrompido → tudo
+  fechado", **esquecendo os circuitos abertos justo sob carga** — o oposto do objetivo. Escrever
+  num temporário e renomear por cima (atômico no POSIX, mesmo FS) garante que todo leitor vê o
+  estado ANTIGO inteiro ou o NOVO inteiro, nunca um meio-termo.
 - **Desligado por padrão:** sem o bloco `disjuntor` (ou com `"habilitado": false`), o
   roteador nem lê o arquivo e o comportamento é idêntico ao de antes (risco zero).
 - Telemetria: um pulo pelo disjuntor sai como `[disjuntor] <nome>: disjuntor aberto (N

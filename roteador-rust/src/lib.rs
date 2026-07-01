@@ -10,6 +10,7 @@
 //! tipados com `Result`, sem `unwrap`/`panic` em produção, telemetria clara.
 
 pub mod alerta;
+pub mod arquivo;
 pub mod config;
 pub mod diagnostico;
 pub mod disjuntor;
