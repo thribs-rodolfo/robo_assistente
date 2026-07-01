@@ -26,6 +26,21 @@ pub const ARQUIVO_LOG: &str = "/var/log/ponte-telegram.log";
 /// Tempo limite para a chamada `sendMessage` ao Telegram.
 const TIMEOUT_TELEGRAM: Duration = Duration::from_secs(20);
 
+/// Quantas vezes RE-enviar uma resposta ao Telegram além da tentativa original, quando a
+/// entrega falha de forma transitória (o servidor REJEITOU: 429/5xx/408). Motivo: a resposta
+/// já foi GERADA — às vezes com uma chamada cara ao Claude — e perdê-la para um blip do
+/// Telegram deixaria o usuário mudo com uma resposta boa na mão. Estende a promessa central
+/// do projeto ("o robô nunca fica mudo") da GERAÇÃO para a ENTREGA.
+const MAX_RETENTATIVAS_ENVIO: u32 = 2;
+
+/// Base do backoff exponencial entre reenvios (250→500→1000ms...). Só usado quando o Telegram
+/// NÃO diz explicitamente quanto esperar (ver `retry_after` no caso 429).
+const ESPERA_BASE_ENVIO_MS: u64 = 500;
+
+/// Teto de espera entre reenvios. Vale sobretudo para o `retry_after` de um 429, que o Telegram
+/// pode pedir grande: estamos numa thread por mensagem, mas travá-la muitos segundos não ajuda.
+const TETO_ESPERA_ENVIO_MS: u64 = 8_000;
+
 /// Configuração de um bot do Telegram, já resolvida (allowFrom expandido).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigBot {
@@ -240,8 +255,26 @@ pub fn enviar_mensagem(token: &str, chat: i64, texto: &str) -> Result<(), FalhaP
     Ok(())
 }
 
-/// Envia UMA mensagem (uma parte já dentro do limite) via `sendMessage`.
+/// Envia UMA mensagem (uma parte já dentro do limite), reenviando em falha transitória.
+///
+/// A tentativa de rede em si vive em [`tentar_enviar_parte`]; a POLÍTICA de reenvio (quando e
+/// quanto esperar) é decidida por [`espera_reenvio`], função pura. A execução (enviar, dormir,
+/// logar) é injetada em [`enviar_com_politica`] para ser testável sem rede/relógio/disco.
 fn enviar_parte(token: &str, chat: i64, texto: &str) -> Result<(), FalhaProvedor> {
+    enviar_com_politica(
+        || tentar_enviar_parte(token, chat, texto),
+        std::thread::sleep,
+        |falha, tentativa, espera| {
+            registrar(&format!(
+                "[telegram] envio falhou ({falha}); reenviando em {}ms (tentativa {tentativa}/{MAX_RETENTATIVAS_ENVIO})",
+                espera.as_millis()
+            ));
+        },
+    )
+}
+
+/// UMA tentativa de `sendMessage` (sem reenvio). Devolve falha tipada em qualquer não-2xx.
+fn tentar_enviar_parte(token: &str, chat: i64, texto: &str) -> Result<(), FalhaProvedor> {
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     let corpo = corpo_send_message(chat, texto);
     let resposta = https::post_json(&url, &corpo, &[], TIMEOUT_TELEGRAM)?;
@@ -252,6 +285,87 @@ fn enviar_parte(token: &str, chat: i64, texto: &str) -> Result<(), FalhaProvedor
             status: resposta.status,
             corpo: resposta.corpo,
         })
+    }
+}
+
+/// Executor do reenvio: tenta `enviar`; em falha, consulta [`espera_reenvio`] e, se mandar
+/// retentar, avisa (`ao_retentar`) e `dorme` antes de tentar de novo. Genérico sobre as três
+/// ações (enviar/dormir/observar) → testável com mocks, sem tocar rede, relógio nem log.
+fn enviar_com_politica(
+    mut enviar: impl FnMut() -> Result<(), FalhaProvedor>,
+    mut dormir: impl FnMut(Duration),
+    mut ao_retentar: impl FnMut(&FalhaProvedor, u32, Duration),
+) -> Result<(), FalhaProvedor> {
+    let mut tentativa_atual = 0u32;
+    loop {
+        match enviar() {
+            Ok(()) => return Ok(()),
+            Err(falha) => match espera_reenvio(&falha, tentativa_atual) {
+                Some(espera) => {
+                    ao_retentar(&falha, tentativa_atual + 1, espera);
+                    dormir(espera);
+                    tentativa_atual += 1;
+                }
+                // Falha não-transitória (ex.: 400 de mensagem malformada) ou orçamento
+                // esgotado: desiste devolvendo o erro (sem engolir em silêncio).
+                None => return Err(falha),
+            },
+        }
+    }
+}
+
+/// Decide a espera antes de RE-enviar uma parte que falhou, ou `None` para desistir.
+///
+/// Função **pura**. Mais CONSERVADORA que [`FalhaProvedor::vale_retentar`] de propósito: só
+/// retenta quando o servidor REJEITOU explicitamente (via [`falha_de_envio_vale_retentar`]) —
+/// aí temos certeza de que a mensagem NÃO foi entregue e reenviar não duplica. Num `429` o
+/// Telegram costuma dizer QUANTO esperar (`retry_after`); quando diz, honramos esse tempo
+/// (limitado por [`TETO_ESPERA_ENVIO_MS`]) em vez do backoff cego.
+fn espera_reenvio(falha: &FalhaProvedor, tentativa_atual: u32) -> Option<Duration> {
+    if tentativa_atual >= MAX_RETENTATIVAS_ENVIO {
+        return None;
+    }
+    if !falha_de_envio_vale_retentar(falha) {
+        return None;
+    }
+    if let FalhaProvedor::Http { status: 429, corpo } = falha {
+        if let Some(segundos) = retry_after_do_corpo(corpo) {
+            let ms = segundos.saturating_mul(1000).min(TETO_ESPERA_ENVIO_MS);
+            return Some(Duration::from_millis(ms));
+        }
+    }
+    Some(crate::retentativa::espera_backoff(
+        tentativa_atual,
+        ESPERA_BASE_ENVIO_MS,
+    ))
+}
+
+/// Uma falha de ENVIO ao Telegram vale reenviar? Só quando o servidor REJEITOU explicitamente
+/// (HTTP 429/5xx/408): nesses casos a mensagem com CERTEZA não foi entregue, então reenviar não
+/// duplica. Falha de REDE (`Rede`) é AMBÍGUA — a mensagem pode ter chegado antes de a conexão
+/// cair — então NÃO reenviamos, para nunca mandar a mesma resposta duas vezes. (Por isso não
+/// reusamos [`FalhaProvedor::vale_retentar`], que trata `Rede` como transitória.)
+fn falha_de_envio_vale_retentar(falha: &FalhaProvedor) -> bool {
+    matches!(
+        falha,
+        FalhaProvedor::Http { status, .. } if matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    )
+}
+
+/// Extrai o `retry_after` (em segundos) do corpo de erro do Telegram, quando presente.
+/// Num `429` o Telegram responde algo como
+/// `{"ok":false,"error_code":429,"parameters":{"retry_after":5}}`. Devolve `None` se o corpo
+/// não trouxer o campo (ou não for JSON válido) — aí o chamador cai no backoff exponencial.
+fn retry_after_do_corpo(corpo: &str) -> Option<u64> {
+    let raiz = json::parsear(corpo).ok()?;
+    let segundos = raiz
+        .obter("parameters")?
+        .obter("retry_after")?
+        .como_numero()?;
+    if segundos.is_finite() && segundos >= 0.0 {
+        Some(segundos as u64)
+    } else {
+        None
     }
 }
 
@@ -495,5 +609,136 @@ mod testes {
         let partes = dividir_resposta(&texto, 7);
         assert!(partes.iter().all(|p| p.chars().count() <= 7));
         assert_eq!(partes.concat(), texto);
+    }
+
+    // -- Reenvio ao Telegram em falha transitória --
+
+    fn http(status: u16, corpo: &str) -> FalhaProvedor {
+        FalhaProvedor::Http {
+            status,
+            corpo: corpo.to_string(),
+        }
+    }
+
+    #[test]
+    fn retry_after_extrai_segundos_do_corpo_do_telegram() {
+        let corpo = r#"{"ok":false,"error_code":429,"parameters":{"retry_after":7}}"#;
+        assert_eq!(retry_after_do_corpo(corpo), Some(7));
+    }
+
+    #[test]
+    fn retry_after_ausente_ou_invalido_vira_none() {
+        assert_eq!(retry_after_do_corpo(r#"{"ok":false}"#), None); // sem parameters
+        assert_eq!(retry_after_do_corpo("não é json"), None); // corpo não-JSON
+        assert_eq!(
+            retry_after_do_corpo(r#"{"parameters":{"outro":1}}"#),
+            None // parameters sem retry_after
+        );
+    }
+
+    #[test]
+    fn envio_so_retenta_falha_rejeitada_pelo_servidor() {
+        // 429/5xx/408: o servidor rejeitou -> não foi entregue -> vale reenviar.
+        assert!(falha_de_envio_vale_retentar(&http(429, "")));
+        assert!(falha_de_envio_vale_retentar(&http(503, "")));
+        assert!(falha_de_envio_vale_retentar(&http(408, "")));
+        // 400/404: problema DA mensagem -> reenviar não conserta -> não retenta.
+        assert!(!falha_de_envio_vale_retentar(&http(400, "")));
+        assert!(!falha_de_envio_vale_retentar(&http(404, "")));
+        // Rede é AMBÍGUA (pode ter chegado) -> não reenvia, pra não duplicar a resposta.
+        assert!(!falha_de_envio_vale_retentar(&FalhaProvedor::Rede(
+            "caiu".into()
+        )));
+    }
+
+    #[test]
+    fn espera_reenvio_honra_retry_after_com_teto() {
+        // 429 com retry_after pequeno: usa exatamente o tempo pedido.
+        let f = http(429, r#"{"parameters":{"retry_after":3}}"#);
+        assert_eq!(espera_reenvio(&f, 0), Some(Duration::from_millis(3000)));
+        // 429 com retry_after absurdo: satura no teto (não trava a thread por minutos).
+        let f = http(429, r#"{"parameters":{"retry_after":99999}}"#);
+        assert_eq!(
+            espera_reenvio(&f, 0),
+            Some(Duration::from_millis(TETO_ESPERA_ENVIO_MS))
+        );
+    }
+
+    #[test]
+    fn espera_reenvio_usa_backoff_quando_sem_retry_after() {
+        // 500 (sem retry_after): backoff exponencial base 500 -> 500, 1000...
+        assert_eq!(
+            espera_reenvio(&http(500, ""), 0),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            espera_reenvio(&http(500, ""), 1),
+            Some(Duration::from_millis(1000))
+        );
+    }
+
+    #[test]
+    fn espera_reenvio_desiste_por_orcamento_ou_falha_definitiva() {
+        // Orçamento esgotado (já reenviou MAX vezes): desiste.
+        assert_eq!(espera_reenvio(&http(500, ""), MAX_RETENTATIVAS_ENVIO), None);
+        // Falha definitiva (400): desiste na hora, mesmo com orçamento.
+        assert_eq!(espera_reenvio(&http(400, ""), 0), None);
+    }
+
+    /// Executor com mocks: conta tentativas de envio e de "sono", sem tocar rede/relógio/log.
+    fn rodar_politica(
+        respostas: Vec<Result<(), FalhaProvedor>>,
+    ) -> (Result<(), FalhaProvedor>, usize, usize) {
+        let mut fila = respostas.into_iter();
+        let mut enviados = 0usize;
+        let mut dormidas = 0usize;
+        let resultado = enviar_com_politica(
+            || {
+                enviados += 1;
+                fila.next().unwrap_or(Ok(()))
+            },
+            |_espera| dormidas += 1,
+            |_falha, _tentativa, _espera| {}, // observador silencioso no teste
+        );
+        (resultado, enviados, dormidas)
+    }
+
+    #[test]
+    fn politica_entrega_de_primeira_nao_reenvia() {
+        let (r, enviados, dormidas) = rodar_politica(vec![Ok(())]);
+        assert!(r.is_ok());
+        assert_eq!(enviados, 1); // uma tentativa só
+        assert_eq!(dormidas, 0); // nenhum reenvio
+    }
+
+    #[test]
+    fn politica_reenvia_e_entrega_apos_blip() {
+        // Falha 503 na 1ª, entrega na 2ª: uma retentativa, uma "dormida".
+        let (r, enviados, dormidas) = rodar_politica(vec![Err(http(503, "")), Ok(())]);
+        assert!(r.is_ok());
+        assert_eq!(enviados, 2);
+        assert_eq!(dormidas, 1);
+    }
+
+    #[test]
+    fn politica_desiste_apos_orcamento_em_falha_persistente() {
+        // 503 sempre: tenta a original + MAX reenvios, depois devolve o erro (sem engolir).
+        let sempre_503 = vec![http(503, ""), http(503, ""), http(503, ""), http(503, "")]
+            .into_iter()
+            .map(Err)
+            .collect();
+        let (r, enviados, dormidas) = rodar_politica(sempre_503);
+        assert!(r.is_err());
+        assert_eq!(enviados as u32, MAX_RETENTATIVAS_ENVIO + 1);
+        assert_eq!(dormidas as u32, MAX_RETENTATIVAS_ENVIO);
+    }
+
+    #[test]
+    fn politica_nao_reenvia_falha_definitiva() {
+        // 400 (mensagem malformada): desiste na 1ª, sem reenvio nem sono.
+        let (r, enviados, dormidas) = rodar_politica(vec![Err(http(400, ""))]);
+        assert!(r.is_err());
+        assert_eq!(enviados, 1);
+        assert_eq!(dormidas, 0);
     }
 }

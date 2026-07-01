@@ -757,7 +757,7 @@ Fluxo de um POST (espelha o `servidor.py`, agora tipado e sem exceções):
 3. responde 200 IMEDIATAMENTE ao Telegram                   (não segura a conexão)
 4. extrai a mensagem; checa allowFrom (lista branca)        -> ignora quem não está
 5. rotear(texto, contexto, config)                          -> texto + qual provedor
-6. enviar_mensagem(token, chat, texto)  (sendMessage HTTPS via curl)
+6. enviar_mensagem(token, chat, texto)  (sendMessage HTTPS via curl; reenvia em falha transitória)
 ```
 
 Config dos bots (com **TOKENS**) mora **fora do repo**, em `/root/.secrets/ponte-telegram.json`:
@@ -778,6 +778,26 @@ Config dos bots (com **TOKENS**) mora **fora do repo**, em `/root/.secrets/ponte
 `allow_from` pode ser inline (lista de IDs) **ou** `allow_from_arquivo` (aponta para um JSON
 com a chave `allowFrom`). Lista vazia = ninguém (seguro por padrão). O endereço de escuta pode
 ser trocado por `PONTE_ENDERECO` (útil para testar numa porta descartável).
+
+### Reenvio ao Telegram em falha transitória
+
+O passo 6 (`enviar_mensagem` → `sendMessage`) **reenvia** quando a entrega falha de forma
+transitória. Motivo: a resposta já foi **gerada** — às vezes com uma chamada cara ao Claude — e
+perdê-la para um blip do Telegram deixaria o usuário mudo com uma resposta boa na mão. É a
+promessa central do projeto ("o robô nunca fica mudo") estendida da **geração** para a **entrega**.
+
+- **Só reenvia quando o servidor REJEITOU** (HTTP `429`/`5xx`/`408`): nesses casos temos certeza
+  de que a mensagem **não** foi entregue, então reenviar não duplica.
+- **Não reenvia falha de rede** (`Rede`): é ambígua — a mensagem pode ter chegado antes de a
+  conexão cair — então preferimos não arriscar mandar a resposta duas vezes.
+- **Não reenvia `400`/`404`** (mensagem malformada): repetir não conserta; desiste na hora.
+- Num `429` o Telegram costuma dizer **quanto** esperar (`parameters.retry_after`); quando diz,
+  honramos esse tempo (limitado por um teto de 8s para não travar a thread). Sem `retry_after`,
+  cai no backoff exponencial (500→1000ms), até `MAX_RETENTATIVAS_ENVIO` (2) reenvios.
+
+A **decisão** é a função pura `espera_reenvio`; a **execução** (enviar/dormir/logar) é injetada
+em `enviar_com_politica`, testada com mocks (sem tocar rede, relógio nem log). O caminho feliz
+(entrega de primeira) é idêntico ao de antes — o reenvio só entra quando a entrega falha.
 
 ```sh
 cargo build --release
