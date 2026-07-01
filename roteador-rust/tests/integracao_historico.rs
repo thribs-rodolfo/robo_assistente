@@ -54,6 +54,7 @@ fn loop_de_memoria_curta_persiste_e_reusa_o_historico() {
             .join("roteador-integracao-hist.log")
             .to_string_lossy()
             .to_string(),
+        orcamento_total_ms: None,
     };
 
     let chat: i64 = 555_001;

@@ -159,6 +159,11 @@ pub struct Config {
     /// hermético — antes, rodar `cargo test` sujava o log de produção e contaminava as
     /// métricas reais do `bin/metricas` (a medida de "% no piso" que é o objetivo do projeto).
     pub telemetria_log: String,
+    /// Orçamento de tempo TOTAL da cadeia (ms). Opcional (`None` = desligado = comportamento
+    /// antigo). Quando definido, assim que o tempo já gasto NESTA mensagem passa do limite, o
+    /// roteador para de tentar provedores de cima e vai direto ao piso (que nunca é pulado).
+    /// Ver [`crate::orcamento`]. Ausente no JSON => `None`.
+    pub orcamento_total_ms: Option<u64>,
 }
 
 impl Config {
@@ -212,12 +217,22 @@ pub fn interpretar(texto_json: &str) -> Result<Config, ErroRoteador> {
         .map(str::to_string)
         .unwrap_or_else(|| crate::telemetria::ARQUIVO_LOG.to_string());
 
+    // Orçamento de tempo total (ms): opcional. Ausente => None (desligado). Quando presente,
+    // clampamos para no mínimo 1ms — um orçamento 0 pularia até o PRIMEIRO provedor e mandaria
+    // toda mensagem direto ao piso, o que é quase sempre um engano de configuração; quem quer
+    // desligar de fato apenas omite o campo.
+    let orcamento_total_ms = raiz
+        .obter("orcamento_total_ms")
+        .and_then(Valor::como_numero)
+        .map(|n| n.max(1.0) as u64);
+
     Ok(Config {
         ordem_fallback,
         provedores,
         disjuntor,
         historico,
         telemetria_log,
+        orcamento_total_ms,
     })
 }
 
@@ -548,5 +563,29 @@ mod testes {
         let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"disjuntor":{"habilitado":true,"limiar_falhas":0}}"#;
         let config = interpretar(bruto).unwrap();
         assert_eq!(config.disjuntor.limiar_falhas, 1);
+    }
+
+    #[test]
+    fn orcamento_ausente_e_none_por_padrao() {
+        // Sem o campo: desligado (comportamento antigo, nunca pula por tempo).
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.orcamento_total_ms, None);
+    }
+
+    #[test]
+    fn orcamento_e_lido_quando_presente() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"orcamento_total_ms":25000}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.orcamento_total_ms, Some(25_000));
+    }
+
+    #[test]
+    fn orcamento_zero_vira_um() {
+        // 0 pularia até o primeiro provedor (manda tudo direto ao piso): quase sempre um
+        // engano. Clampamos para 1ms; quem quer desligar apenas omite o campo.
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"orcamento_total_ms":0}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.orcamento_total_ms, Some(1));
     }
 }

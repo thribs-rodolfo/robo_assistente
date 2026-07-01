@@ -75,6 +75,7 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
             .join("roteador-integracao-disjuntor.log")
             .to_string_lossy()
             .to_string(),
+        orcamento_total_ms: None,
     };
 
     // Duas rodadas: o topo morto falha nas duas; o Ollama (piso) responde nas duas.

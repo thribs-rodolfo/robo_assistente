@@ -113,6 +113,7 @@ fn openai_compat_local_http_roteia_sem_chave() {
             .join("roteador-integracao-openai-compat-local.log")
             .to_string_lossy()
             .to_string(),
+        orcamento_total_ms: None,
     };
 
     // 3. Roteia de verdade pelo nosso cliente HTTP cru (sem curl/TLS, sem chave).

@@ -21,6 +21,7 @@ pub mod http;
 pub mod https;
 pub mod json;
 pub mod metricas;
+pub mod orcamento;
 pub mod ponte;
 pub mod prompt;
 pub mod provedor;
@@ -65,6 +66,11 @@ pub fn rotear(
     let mut motivos: Vec<String> = Vec::new();
     let mut algum_provedor_construido = false;
 
+    // Marca o início da cadeia para o orçamento de tempo TOTAL (ver [`orcamento`]). Quando o
+    // orçamento está desligado (`orcamento_total_ms: None`, o padrão), este relógio é medido mas
+    // nunca dispara pulo — o roteamento fica idêntico ao de antes.
+    let inicio_total = std::time::Instant::now();
+
     // Disjuntor (circuit breaker): quando LIGADO na config, pulamos provedores que vêm
     // falhando em série, sem pagar a latência deles a cada mensagem. Desligado (padrão),
     // nada disto roda — nem lemos o arquivo — e o roteamento é idêntico ao de antes.
@@ -90,6 +96,24 @@ pub fn rotear(
                 continue;
             }
         };
+
+        // Orçamento de tempo TOTAL: se o tempo já gasto NESTA mensagem passou do limite, paramos
+        // de tentar provedores de cima (caros/incertos) e vamos direto ao piso. O piso (último)
+        // NUNCA é pulado — a promessa "o robô nunca fica mudo" segue de pé. Desligado por padrão
+        // (`orcamento_total_ms: None`), nunca dispara. Ver [`orcamento::deve_pular_por_orcamento`].
+        let eh_piso = indice == indice_piso;
+        let decorrido_ms = inicio_total.elapsed().as_millis();
+        if orcamento::deve_pular_por_orcamento(config.orcamento_total_ms, decorrido_ms, eh_piso) {
+            // `unwrap_or(0)` é só para formatar a mensagem; a decisão de pular já garantiu
+            // que o orçamento existe (é `Some`) e foi estourado.
+            let limite = config.orcamento_total_ms.unwrap_or(0);
+            let motivo = format!(
+                "{nome}: orçamento total de {limite}ms esgotado ({decorrido_ms}ms decorridos) — indo direto ao piso"
+            );
+            telemetria::registrar_em(&config.telemetria_log, &format!("[orcamento] {motivo}"));
+            motivos.push(motivo);
+            continue;
+        }
 
         // Constrói a implementação concreta a partir do `tipo`.
         let provedor = match provedor::construir(config_provedor) {
@@ -436,6 +460,7 @@ mod testes {
             disjuntor: Default::default(),
             historico: Default::default(),
             telemetria_log: LOG_TESTE.to_string(),
+            orcamento_total_ms: None,
         };
         let erro = rotear("oi", &Contexto::vazio(), &config).unwrap_err();
         assert_eq!(erro, ErroRoteador::SemProvedores);
@@ -649,5 +674,57 @@ mod testes {
         );
 
         let _ = std::fs::remove_file(&caminho);
+    }
+
+    #[test]
+    fn orcamento_estourado_pula_provedor_do_meio_mas_nunca_o_piso() {
+        // Cadeia [topo, meio, piso], todos em porta morta (falham por rede). O 'topo' tem
+        // 1 retentativa com espera de 40ms: a falha de rede é transitória, então ele tenta,
+        // dorme ~40ms e tenta de novo — consumindo tempo REAL de forma determinística. Com um
+        // orçamento total de 15ms, ao chegar no 'meio' o tempo já estourou -> o 'meio' deve ser
+        // PULADO por orçamento (nem toca a rede). O 'piso' (último) NUNCA é pulado: é tentado
+        // (e falha, porta morta). Prova que o orçamento poupa os provedores DO MEIO mas preserva
+        // a garantia do piso.
+        let json = r#"{
+            "ordem_fallback": ["topo", "meio", "piso"],
+            "orcamento_total_ms": 15,
+            "provedores": {
+                "topo": {"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1,
+                         "retentativas":1,"retentativa_espera_ms":40},
+                "meio": {"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1},
+                "piso": {"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}
+            },
+            "telemetria_log": "/tmp/roteador-testes-lib.log"
+        }"#;
+        let config = interpretar(json).unwrap();
+
+        match rotear("oi", &Contexto::vazio(), &config).unwrap_err() {
+            ErroRoteador::TodosFalharam(motivos) => {
+                assert_eq!(
+                    motivos.len(),
+                    3,
+                    "topo tentado + meio pulado + piso tentado"
+                );
+                // O 'topo' foi TENTADO (decorrido ~0 no começo): falha real, não orçamento.
+                assert!(
+                    motivos[0].starts_with("topo:") && !motivos[0].contains("orçamento"),
+                    "topo devia ser tentado, não pulado por orçamento; veio: {}",
+                    motivos[0]
+                );
+                // O 'meio' foi PULADO por orçamento (o tempo do topo já estourou os 15ms).
+                assert!(
+                    motivos[1].starts_with("meio:") && motivos[1].contains("orçamento total"),
+                    "meio devia ser pulado por orçamento; veio: {}",
+                    motivos[1]
+                );
+                // O 'piso' NUNCA é pulado por orçamento: tentado (e falha, porta morta).
+                assert!(
+                    motivos[2].starts_with("piso:") && !motivos[2].contains("orçamento"),
+                    "piso nunca é pulado por orçamento; veio: {}",
+                    motivos[2]
+                );
+            }
+            outro => panic!("esperava TodosFalharam, veio {outro:?}"),
+        }
     }
 }

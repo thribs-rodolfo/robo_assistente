@@ -39,6 +39,7 @@ fn ollama_local_responde_de_verdade() {
             .join("roteador-integracao-ollama.log")
             .to_string_lossy()
             .to_string(),
+        orcamento_total_ms: None,
     };
 
     let resposta = rotear(

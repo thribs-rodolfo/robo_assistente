@@ -56,6 +56,7 @@ e citar o nome na `ordem_fallback`.
 | `duracao.rs`    | Converte durações legíveis ("24h", "90m") <-> segundos          |
 | `verificacao.rs`| Doutor ESTÁTICO da config (piso, ordem, chaves) — funções puras |
 | `diagnostico.rs`| Doutor VIVO do piso: sonda o Ollama (`GET /api/tags`) — nunca toca Claude |
+| `orcamento.rs`  | Orçamento de tempo TOTAL da cadeia: pula provedores de cima após o limite (piso nunca) — opt-in |
 | `lib.rs`        | `rotear()` — a cadeia de fallback                               |
 | `servidor_http.rs` | Servidor HTTP/1.1 cru (parse de requisição + resposta)       |
 | `ponte.rs`      | Ponte Telegram: config dos bots, allowFrom, `sendMessage`, processar |
@@ -301,6 +302,35 @@ de 5s, pois estamos no caminho de uma mensagem viva). Cada retentativa sai na te
 **Desligado por padrão:** `retentativas` é por provedor e vale **0** quando ausente — uma
 tentativa só, comportamento idêntico ao de antes, sem latência extra. Campos (por provedor,
 opcionais): `retentativas` (0), `retentativa_espera_ms` (250).
+
+## Orçamento de tempo total da cadeia (`orcamento_total_ms`)
+
+**Problema que resolve:** cada provedor tem o seu `timeout`, mas nada limitava o tempo
+**somado** da cadeia. Se o Claude trava até o timeout (ex.: 30s) e só então o Gemini é tentado
+e depois o Ollama (mais ~35s), o usuário espera **mais de um minuto** por uma resposta de chat.
+O orçamento total corta esse cenário.
+
+**Como funciona:** o roteador marca o início da cadeia e, **antes de começar cada provedor**,
+pergunta a `orcamento::deve_pular_por_orcamento` se o tempo já gasto NESTA mensagem passou do
+limite. Se passou, o provedor de cima é **pulado** (sai `[orcamento] <nome>: orçamento total de
+Xms esgotado (Yms decorridos) — indo direto ao piso`) e a cadeia segue rumo ao **piso**, que
+**nunca é pulado** — a promessa "o robô nunca fica mudo" segue de pé.
+
+**Complementa o disjuntor:** o disjuntor pula um provedor por **histórico** (vem falhando em
+série, em mensagens anteriores); o orçamento pula por **tempo gasto NESTA mensagem** (mesmo um
+provedor saudável que simplesmente demorou demais nesta rodada). Sinais diferentes, objetivo
+convergente: depender menos da latência da cadeia de cima.
+
+**Limitação honesta:** a checagem é **entre** provedores (antes de começar o próximo). Um
+provedor **já iniciado** roda até o seu próprio `timeout` — não abortamos no meio da chamada
+(exigiria cancelamento de I/O). O orçamento governa **quando parar de escalar**, não é um
+relógio de parada rígido: o tempo total pode passar do orçamento pela duração do provedor em
+curso.
+
+**Desligado por padrão:** `orcamento_total_ms` é opcional e global. Ausente => sem orçamento =
+comportamento antigo (nunca pula por tempo). Presente, é clampado para no mínimo `1` (um `0`
+mandaria toda mensagem direto ao piso, quase sempre um engano). Exemplo: `"orcamento_total_ms":
+25000` (não escale para provedores de cima depois de 25s já gastos nesta mensagem).
 
 ## Memória curta de conversa (`historico`)
 
