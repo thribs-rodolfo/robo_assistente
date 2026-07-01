@@ -28,18 +28,47 @@ pub struct MetricasProvedor {
     /// (`[disjuntor] <nome>: disjuntor aberto (...) — pulando`). Cada pulo é a latência de
     /// um provedor morto que a cadeia NÃO pagou — a economia que o disjuntor entrega.
     pub disjuntor_pulos: u64,
-    /// Soma das latências (ms) das respostas com sucesso — para tirar a média depois.
-    pub latencia_total_ms: u128,
+    /// Latência (ms) de CADA resposta com sucesso, na ordem em que apareceram no log.
+    /// Guardamos a lista inteira (não só a soma) para poder tirar tanto a média quanto os
+    /// percentis (p50/p95) e o máximo — a média sozinha esconde a "cauda" (o provedor que
+    /// costuma ir bem mas às vezes trava). É o sinal de performance que o goal pede.
+    pub latencias_ms: Vec<u128>,
 }
 
 impl MetricasProvedor {
     /// Latência média (ms) das respostas com sucesso, ou `None` se nunca respondeu.
     pub fn latencia_media_ms(&self) -> Option<u128> {
-        if self.sucessos == 0 {
+        if self.latencias_ms.is_empty() {
             None
         } else {
-            Some(self.latencia_total_ms / self.sucessos as u128)
+            let soma: u128 = self.latencias_ms.iter().sum();
+            Some(soma / self.latencias_ms.len() as u128)
         }
+    }
+
+    /// Percentil `p` (0–100) das latências de sucesso, em ms, ou `None` se nunca respondeu.
+    ///
+    /// Método "nearest-rank" (o mais simples e didático): ordena uma cópia das latências e
+    /// pega o elemento de posição `ceil(p/100 · n)`. Ex.: com 20 amostras, o p95 é a 19ª
+    /// (as duas mais lentas ficam acima). Diferente da média, o p95 mostra "quão ruim fica
+    /// nos piores casos" — é o que dói para o usuário esperando resposta.
+    pub fn latencia_percentil(&self, p: u8) -> Option<u128> {
+        if self.latencias_ms.is_empty() {
+            return None;
+        }
+        let mut ordenado = self.latencias_ms.clone();
+        ordenado.sort_unstable();
+        let n = ordenado.len();
+        // rank vai de 1 a n; o índice do vetor é rank-1. `p=0` cai no menor (índice 0).
+        let rank = ((p as f64 / 100.0) * n as f64).ceil() as usize;
+        let indice = rank.saturating_sub(1).min(n - 1);
+        Some(ordenado[indice])
+    }
+
+    /// Maior latência (ms) já vista neste provedor, ou `None` se nunca respondeu.
+    /// É o pior caso absoluto — útil para flagrar travadas raras que nem o p95 pega.
+    pub fn latencia_maxima_ms(&self) -> Option<u128> {
+        self.latencias_ms.iter().copied().max()
     }
 }
 
@@ -248,7 +277,7 @@ impl Evento {
             Evento::Sucesso { nome, latencia_ms } => {
                 let m = por_provedor.entry(nome).or_default();
                 m.sucessos += 1;
-                m.latencia_total_ms += latencia_ms;
+                m.latencias_ms.push(latencia_ms);
             }
             Evento::Falha { nome } => por_provedor.entry(nome).or_default().falhas += 1,
             Evento::Pulo { nome } => por_provedor.entry(nome).or_default().pulos += 1,
@@ -354,9 +383,18 @@ impl std::fmt::Display for Relatorio {
             return Ok(());
         }
         for (nome, m) in &self.por_provedor {
+            // Latência: sempre a média; com 2+ respostas, também p50/p95/máx para revelar a
+            // cauda que a média esconde. Com 1 só resposta, os percentis seriam iguais à
+            // média (ruído), então mostramos só a média.
             let latencia = match m.latencia_media_ms() {
-                Some(ms) => format!("{ms}ms média"),
                 None => "—".to_string(),
+                Some(media) if m.sucessos >= 2 => {
+                    let p50 = m.latencia_percentil(50).unwrap_or(media);
+                    let p95 = m.latencia_percentil(95).unwrap_or(media);
+                    let maxima = m.latencia_maxima_ms().unwrap_or(media);
+                    format!("{media}ms média (p50 {p50} / p95 {p95} / máx {maxima})")
+                }
+                Some(media) => format!("{media}ms média"),
             };
             // O pulo por disjuntor só aparece quando houve algum — mantém a linha enxuta
             // no caso comum (disjuntor desligado), sem poluir com "0 disjuntor" em todo lugar.
@@ -627,6 +665,54 @@ linha de ruído sem formato
             "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
         let texto = format!("{}", agregar(log));
         assert!(!texto.contains("disjuntor"));
+    }
+
+    #[test]
+    fn percentis_e_maximo_de_latencia() {
+        // 20 respostas de 100ms e uma de 5000ms: a média fica "ok", mas o máx e o p95 gritam.
+        let mut m = MetricasProvedor::default();
+        for _ in 0..20 {
+            m.sucessos += 1;
+            m.latencias_ms.push(100);
+        }
+        m.sucessos += 1;
+        m.latencias_ms.push(5000);
+
+        // Média puxada só um pouco pela travada: (20*100 + 5000)/21 = 333ms.
+        assert_eq!(m.latencia_media_ms(), Some(333));
+        // p50 = mediana = 100ms (a maioria é rápida).
+        assert_eq!(m.latencia_percentil(50), Some(100));
+        // p95 sobre 21 amostras: ceil(0.95*21)=20 -> índice 19 -> ainda 100ms (só 1 é lenta).
+        assert_eq!(m.latencia_percentil(95), Some(100));
+        // O máximo é o único jeito de ver a travada de 5s.
+        assert_eq!(m.latencia_maxima_ms(), Some(5000));
+        // p100 == máximo; p0 == mínimo.
+        assert_eq!(m.latencia_percentil(100), Some(5000));
+        assert_eq!(m.latencia_percentil(0), Some(100));
+    }
+
+    #[test]
+    fn percentis_de_provedor_sem_resposta_sao_none() {
+        let m = MetricasProvedor::default();
+        assert_eq!(m.latencia_media_ms(), None);
+        assert_eq!(m.latencia_percentil(95), None);
+        assert_eq!(m.latencia_maxima_ms(), None);
+    }
+
+    #[test]
+    fn display_mostra_percentis_com_duas_ou_mais_respostas() {
+        // claude respondeu 2x (800 e 1200ms) -> aparece p50/p95/máx; ollama 1x -> só média.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'claude' em 1200ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+";
+        let texto = format!("{}", agregar(log));
+        // Duas respostas: mostra a cauda (máx = 1200, o pior caso).
+        assert!(texto.contains("1000ms média (p50 800 / p95 1200 / máx 1200)"));
+        // Uma só resposta: sem percentis redundantes, apenas a média.
+        assert!(texto.contains("30000ms média"));
+        assert!(!texto.contains("30000ms média (p50"));
     }
 
     #[test]

@@ -125,13 +125,23 @@ realmente depende?"**. É só leitura — nunca dispara provedor, seguro rodar �
 ./target/release/metricas /outro/caminho.log # outro arquivo
 # == Métricas do roteador de provedores ==
 # - groq: 0 ok, 9 falha, 1 pulo, 0 cfg | —
-# - ollama_local: 3 ok, 10 falha, 0 pulo, 0 cfg | 1233ms média
-# total de roteamentos: 3
-# caiu no piso (Ollama): 3 de 3 (100.0%)
+# - ollama_local: 6 ok, 42 falha, 0 pulo, 0 cfg | 7310ms média (p50 363 / p95 38603 / máx 38603)
+# total de roteamentos: 6
+# caiu no piso (Ollama): 6 de 6 (100.0%)
 ```
 
 A linha-chave é a última: **quantas vezes caímos no piso (Ollama)**. Quanto maior o %,
 mais o robô está rodando sem provedor bom — sinal pra investigar Claude/Groq/Gemini.
+
+### Latência: média + percentis (performance)
+
+A latência aparece por provedor. Com **2 ou mais respostas**, além da média mostramos
+**p50 / p95 / máx** — porque a **média mente**: no exemplo acima o Ollama tem "7310ms
+média", mas o p50 é 363ms (metade das respostas é rápida) e o p95/máx revela uma travada
+de **38,6 s** que a média dilui. O p95 é "quão ruim fica nos piores casos" (o que dói pro
+usuário esperando); o máx é o pior caso absoluto. Com 1 só resposta, os percentis seriam
+iguais à média (ruído), então mostramos só a média. Método: *nearest-rank* sobre as
+latências ordenadas (didático e sem dependência).
 
 ### Pulos por disjuntor (economia)
 
