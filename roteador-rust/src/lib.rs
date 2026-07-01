@@ -11,6 +11,7 @@
 
 pub mod alerta;
 pub mod config;
+pub mod diagnostico;
 pub mod disjuntor;
 pub mod duracao;
 pub mod erro;

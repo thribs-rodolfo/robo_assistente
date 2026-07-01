@@ -38,6 +38,11 @@ path = "src/bin/alerta.rs"
 name = "verificar-config"
 path = "src/bin/verificar_config.rs"
 
+# Diagnostico: sonda se o PISO (Ollama) está vivo com o modelo certo (GET /api/tags) — nunca toca o Claude.
+[[bin]]
+name = "diagnostico"
+path = "src/bin/diagnostico.rs"
+
 # Linters estritos: build limpo, zero warning (cargo clippy -D warnings).
 [lints.rust]
 unsafe_code = "forbid"

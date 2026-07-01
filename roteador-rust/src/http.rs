@@ -41,6 +41,49 @@ pub fn post_json(
 ) -> Result<RespostaHttp, FalhaProvedor> {
     let partes = dividir_url(url)?;
 
+    // Monta a requisição HTTP/1.1 à mão. `Connection: close` simplifica a leitura:
+    // o servidor fecha o socket no fim, então sabemos onde o corpo termina.
+    let mut requisicao = String::new();
+    requisicao.push_str(&format!("POST {} HTTP/1.1\r\n", partes.caminho));
+    requisicao.push_str(&format!("Host: {}\r\n", partes.host));
+    requisicao.push_str("Connection: close\r\n");
+    requisicao.push_str("Content-Type: application/json\r\n");
+    for (chave, valor) in cabecalhos_extra {
+        requisicao.push_str(&format!("{chave}: {valor}\r\n"));
+    }
+    requisicao.push_str(&format!("Content-Length: {}\r\n", corpo_json.len()));
+    requisicao.push_str("\r\n");
+    requisicao.push_str(corpo_json);
+
+    enviar_requisicao(&partes, &requisicao, tempo_limite)
+}
+
+/// Faz um GET simples para uma URL `http://...` e devolve status + corpo.
+///
+/// Serve para consultas BARATAS que não rodam inferência — em especial a checagem de
+/// vivacidade do Ollama (`GET /api/tags`, que só lista os modelos instalados). Ver
+/// [`crate::diagnostico`]. GET não tem corpo: por isso não mandamos `Content-Length`.
+pub fn get(url: &str, tempo_limite: Duration) -> Result<RespostaHttp, FalhaProvedor> {
+    let partes = dividir_url(url)?;
+
+    let mut requisicao = String::new();
+    requisicao.push_str(&format!("GET {} HTTP/1.1\r\n", partes.caminho));
+    requisicao.push_str(&format!("Host: {}\r\n", partes.host));
+    requisicao.push_str("Connection: close\r\n");
+    requisicao.push_str("\r\n");
+
+    enviar_requisicao(&partes, &requisicao, tempo_limite)
+}
+
+/// Abre o socket (com timeout), envia a requisição JÁ MONTADA e lê a resposta inteira.
+///
+/// Compartilhado por [`post_json`] e [`get`]: o que muda entre eles é só o texto da
+/// requisição; a mecânica de rede (conectar, timeouts, escrever, ler até fechar) é a mesma.
+fn enviar_requisicao(
+    partes: &UrlPartes,
+    requisicao: &str,
+    tempo_limite: Duration,
+) -> Result<RespostaHttp, FalhaProvedor> {
     // Resolve o endereço e conecta com timeout (não trava para sempre se o host sumir).
     let endereco = format!("{}:{}", partes.host, partes.porta);
     let mut enderecos = std::net::ToSocketAddrs::to_socket_addrs(&endereco)
@@ -56,20 +99,6 @@ pub fn post_json(
     conexao
         .set_write_timeout(Some(tempo_limite))
         .map_err(|e| FalhaProvedor::Rede(format!("timeout de escrita: {e}")))?;
-
-    // Monta a requisição HTTP/1.1 à mão. `Connection: close` simplifica a leitura:
-    // o servidor fecha o socket no fim, então sabemos onde o corpo termina.
-    let mut requisicao = String::new();
-    requisicao.push_str(&format!("POST {} HTTP/1.1\r\n", partes.caminho));
-    requisicao.push_str(&format!("Host: {}\r\n", partes.host));
-    requisicao.push_str("Connection: close\r\n");
-    requisicao.push_str("Content-Type: application/json\r\n");
-    for (chave, valor) in cabecalhos_extra {
-        requisicao.push_str(&format!("{chave}: {valor}\r\n"));
-    }
-    requisicao.push_str(&format!("Content-Length: {}\r\n", corpo_json.len()));
-    requisicao.push_str("\r\n");
-    requisicao.push_str(corpo_json);
 
     conexao
         .write_all(requisicao.as_bytes())

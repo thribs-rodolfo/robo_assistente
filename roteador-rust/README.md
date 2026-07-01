@@ -54,6 +54,7 @@ e citar o nome na `ordem_fallback`.
 | `alerta.rs`     | Decide (função pura) quando avisar o Thiago que caiu no piso    |
 | `duracao.rs`    | Converte durações legíveis ("24h", "90m") <-> segundos          |
 | `verificacao.rs`| Doutor ESTÁTICO da config (piso, ordem, chaves) — funções puras |
+| `diagnostico.rs`| Doutor VIVO do piso: sonda o Ollama (`GET /api/tags`) — nunca toca Claude |
 | `lib.rs`        | `rotear()` — a cadeia de fallback                               |
 | `servidor_http.rs` | Servidor HTTP/1.1 cru (parse de requisição + resposta)       |
 | `ponte.rs`      | Ponte Telegram: config dos bots, allowFrom, `sendMessage`, processar |
@@ -61,6 +62,7 @@ e citar o nome na `ordem_fallback`.
 | `bin/metricas`  | Lê o log de telemetria e imprime as métricas (só leitura)       |
 | `bin/alerta`    | Avisa o Thiago quando o robô cai no piso (Ollama) N vezes seguidas |
 | `bin/verificar-config` | Confere a config antes do deploy (só leitura, nunca dispara provedor) |
+| `bin/diagnostico` | Sonda se o piso (Ollama) está vivo com o modelo certo — nunca toca Claude |
 
 ## Config
 
@@ -414,6 +416,50 @@ quebrada:
 
 Resumo: 3 erros e 1 aviso.
 ```
+
+## Diagnóstico do piso (`bin/diagnostico`)
+
+O `verificar-config` é um doutor **estático**: lê a config e aponta erros no papel. Mas há um
+buraco que só a realidade revela — **e se o próprio piso (Ollama) estiver fora do ar?** Toda a
+garantia do projeto ("o robô nunca fica mudo") depende do último provedor da cadeia responder.
+Os alarmes do `bin/alerta` medem "caí no piso DEMAIS" — mas *assumem* que o piso responde. Se o
+Ollama cair, o robô fica mudo e nenhum alarme existente pega isso.
+
+O `bin/diagnostico` é o doutor **vivo** desse ponto único de falha. Ele:
+
+- identifica o piso (o último da `ordem_fallback`);
+- faz uma checagem **barata**: `GET /api/tags` do Ollama — só **lista** os modelos instalados,
+  **não roda inferência** (não paga os ~33s de uma geração);
+- confirma que o **modelo configurado está instalado** (senão a geração falharia);
+- é **seguro**: só sonda piso do tipo `ollama` (HTTP local, custo zero, sem token). Se o piso
+  for outro tipo (Claude/pago), **recusa sondar de propósito** — jamais dispara o Claude "pra
+  testar" (ver `licao-refresh-token-rotativo`).
+
+```
+diagnostico                         # sonda o piso da config padrão (/root/.secrets/…)
+diagnostico /tmp/outra-config.json  # sonda o piso de outra config
+```
+
+Código de saída (útil em cron: `diagnostico || avisar-thiago`):
+
+| Saída | Significado |
+|-------|-------------|
+| **0** | piso vivo e com o modelo certo instalado |
+| **1** | piso **comprometido**: fora do ar, sem o modelo, desabilitado, ou inexistente |
+| **2** | não deu para verificar (piso não é Ollama → não sondamos) |
+
+Exemplos reais (provados ao vivo, Claude jamais tocado):
+
+```
+✅ Piso 'ollama_local' vivo e com o modelo 'qwen2.5:1.5b' instalado.
+❌ Piso 'ollama_local' respondeu, mas o modelo 'llama3:70b' NÃO está instalado. Instalados: qwen2.5:1.5b, tinyllama:latest.
+❌ Piso 'piso' fora do ar: rede: falha ao conectar em 127.0.0.1:1: Connection refused (os error 111).
+❌ Piso 'piso' está DESABILITADO na config — o robô fica mudo se a cadeia cair.
+⚠️ Piso 'claude' é do tipo 'claude_cli' (não-Ollama); não sondei para não disparar provedor pago/Claude. Vivacidade NÃO confirmada.
+```
+
+A decisão é feita por funções **puras** (`avaliar_resposta_tags`, `modelo_presente`,
+`nomes_dos_modelos`), testáveis sem rede; só `verificar_piso` abre o socket.
 
 ## Ponte Telegram (`bin/ponte-telegram`)
 
