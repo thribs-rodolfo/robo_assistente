@@ -69,6 +69,7 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
             cooldown_maximo_segundos: 86_400,
             caminho_estado: caminho_estado.clone(),
         },
+        historico: Default::default(),
         // Telemetria para arquivo temporário: não suja o log de produção (fonte das métricas).
         telemetria_log: std::env::temp_dir()
             .join("roteador-integracao-disjuntor.log")

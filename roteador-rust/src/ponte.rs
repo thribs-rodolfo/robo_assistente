@@ -317,11 +317,20 @@ pub fn processar(bot: &ConfigBot, corpo_update: &str, config_roteador: &Config) 
         bot.nome, mensagem.remetente, resumo
     ));
 
+    // Memória curta: carrega os últimos turnos deste chat (se ligada na config). Desligada
+    // (padrão), volta vazia e o roteamento é idêntico ao de antes. Falha de leitura degrada
+    // para "sem memória" DENTRO do módulo (nunca derruba a resposta).
+    let historico = if config_roteador.historico.habilitado {
+        crate::historico::carregar(&config_roteador.historico, mensagem.chat)
+    } else {
+        Vec::new()
+    };
+
     // Roteia pela cadeia de fallback. O Ollama local na cauda garante que quase sempre
     // há resposta; só se TUDO falhar mandamos um aviso curto (sem deixar o usuário no vácuo).
     let contexto = Contexto {
         sistema: Some(bot.sistema.clone().unwrap_or_else(sistema_padrao)),
-        historico: Vec::new(),
+        historico,
     };
     let resposta = match rotear(&mensagem.texto, &contexto, config_roteador) {
         Ok(roteada) => {
@@ -329,6 +338,21 @@ pub fn processar(bot: &ConfigBot, corpo_update: &str, config_roteador: &Config) 
                 "[{}] respondido pelo provedor '{}'",
                 bot.nome, roteada.provedor
             ));
+            // Só uma resposta REAL entra na memória (a de cortesia do ramo de erro NÃO entra —
+            // memorizar "não consegui pensar" poluiria o contexto das próximas mensagens).
+            if config_roteador.historico.habilitado {
+                if let Err(erro) = crate::historico::registrar_troca(
+                    &config_roteador.historico,
+                    mensagem.chat,
+                    &contexto.historico,
+                    &mensagem.texto,
+                    &roteada.texto,
+                ) {
+                    // Best-effort: a resposta já vai ser enviada; perder a memória de um turno
+                    // é degradação aceitável. Loga (nunca engole em silêncio), mas não falha.
+                    registrar(&format!("[{}] não gravei o histórico: {erro}", bot.nome));
+                }
+            }
             roteada.texto
         }
         Err(erro) => {

@@ -108,6 +108,40 @@ impl Default for ConfigDisjuntor {
     }
 }
 
+/// Ajustes da memória curta de conversa por chat — ver [`crate::historico`].
+///
+/// Bloco OPCIONAL no JSON (chave `"historico"`). Ausente => `Default` = DESLIGADO, e a ponte
+/// roteia SEM histórico, exatamente como antes (risco zero para quem não configura). Para
+/// ligar: `"historico": {"habilitado": true}` (diretório/tetos têm padrões sensatos).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigHistorico {
+    /// Liga/desliga a memória curta. Desligada, a ponte nem lê/grava arquivo de histórico.
+    pub habilitado: bool,
+    /// Diretório (fora do repositório) onde guardar um arquivo por chat (`<chat>.json`).
+    pub diretorio: String,
+    /// Quantos turnos (mensagens) manter por chat. Os mais antigos são descartados.
+    pub max_turnos: usize,
+    /// Teto de caracteres por turno guardado (trunca textos longos: limita disco e prompt).
+    pub max_chars_por_turno: usize,
+}
+
+/// Diretório padrão dos históricos de conversa (fora do repositório; operacional).
+pub const DIRETORIO_HISTORICO_PADRAO: &str = "/var/log/roteador-historico";
+
+impl Default for ConfigHistorico {
+    fn default() -> Self {
+        // Padrões conservadores: desligado, e — quando ligado — 6 turnos (3 trocas) por chat,
+        // cada turno truncado em 2000 chars (memória curta o bastante para dar contexto sem
+        // inflar o prompt/custo do provedor).
+        ConfigHistorico {
+            habilitado: false,
+            diretorio: DIRETORIO_HISTORICO_PADRAO.to_string(),
+            max_turnos: 6,
+            max_chars_por_turno: 2000,
+        }
+    }
+}
+
 /// Configuração completa do roteador: a ordem de fallback + os provedores declarados.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -117,6 +151,8 @@ pub struct Config {
     pub provedores: Vec<ConfigProvedor>,
     /// Ajustes do disjuntor. Ausente no JSON => `Default` (desligado).
     pub disjuntor: ConfigDisjuntor,
+    /// Ajustes da memória curta. Ausente no JSON => `Default` (desligada).
+    pub historico: ConfigHistorico,
     /// Onde gravar a telemetria (qual provedor respondeu, por que caiu). Ausente no JSON =>
     /// o log de produção ([`crate::telemetria::ARQUIVO_LOG`]). Existe para NÃO ter um caminho
     /// global escondido: os testes apontam para um arquivo temporário e o roteamento fica
@@ -166,6 +202,7 @@ pub fn interpretar(texto_json: &str) -> Result<Config, ErroRoteador> {
     }
 
     let disjuntor = interpretar_disjuntor(raiz.obter("disjuntor"));
+    let historico = interpretar_historico(raiz.obter("historico"));
 
     // Caminho da telemetria: opcional. Ausente => o log de produção. Só quem escreve teste
     // aponta para outro lugar (arquivo temporário) para não sujar as métricas reais.
@@ -179,8 +216,48 @@ pub fn interpretar(texto_json: &str) -> Result<Config, ErroRoteador> {
         ordem_fallback,
         provedores,
         disjuntor,
+        historico,
         telemetria_log,
     })
+}
+
+/// Extrai o bloco `historico` (opcional). Ausente ou não-objeto => `Default` (desligado).
+/// Cada campo cai no padrão quando falta, então `{"habilitado": true}` já basta para ligar.
+fn interpretar_historico(valor: Option<&Valor>) -> ConfigHistorico {
+    let padrao = ConfigHistorico::default();
+    let valor = match valor {
+        Some(v) => v,
+        None => return padrao,
+    };
+
+    let habilitado = valor
+        .obter("habilitado")
+        .and_then(Valor::como_booleano)
+        .unwrap_or(padrao.habilitado);
+    let diretorio = valor
+        .obter("diretorio")
+        .and_then(Valor::como_texto)
+        .map(str::to_string)
+        .unwrap_or(padrao.diretorio);
+    // Mínimo 1 turno: guardar "0 turnos" equivaleria a desligar, mas com o custo de gravar
+    // arquivo vazio a cada mensagem — sem sentido. Quem quer desligar usa `habilitado: false`.
+    let max_turnos = valor
+        .obter("max_turnos")
+        .and_then(Valor::como_numero)
+        .map(|n| n.max(1.0) as usize)
+        .unwrap_or(padrao.max_turnos);
+    let max_chars_por_turno = valor
+        .obter("max_chars_por_turno")
+        .and_then(Valor::como_numero)
+        .map(|n| n.max(1.0) as usize)
+        .unwrap_or(padrao.max_chars_por_turno);
+
+    ConfigHistorico {
+        habilitado,
+        diretorio,
+        max_turnos,
+        max_chars_por_turno,
+    }
 }
 
 /// Extrai o bloco `disjuntor` (opcional). Ausente ou não-objeto => `Default` (desligado).
@@ -425,6 +502,45 @@ mod testes {
             config.provedor("fixo").unwrap().mensagem_fixa.as_deref(),
             Some("Estou indisponível, tente já já.")
         );
+    }
+
+    #[test]
+    fn historico_ausente_vem_desligado_por_padrao() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(!config.historico.habilitado);
+        assert_eq!(config.historico, ConfigHistorico::default());
+    }
+
+    #[test]
+    fn historico_liga_e_le_campos() {
+        let bruto = r#"{
+            "ordem_fallback":["g"],
+            "provedores":{"g":{"tipo":"ollama"}},
+            "historico":{"habilitado":true,"diretorio":"/tmp/hist","max_turnos":8,"max_chars_por_turno":500}
+        }"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(config.historico.habilitado);
+        assert_eq!(config.historico.diretorio, "/tmp/hist");
+        assert_eq!(config.historico.max_turnos, 8);
+        assert_eq!(config.historico.max_chars_por_turno, 500);
+    }
+
+    #[test]
+    fn historico_so_com_habilitado_usa_padroes() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"historico":{"habilitado":true}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(config.historico.habilitado);
+        assert_eq!(config.historico.diretorio, DIRETORIO_HISTORICO_PADRAO);
+        assert_eq!(config.historico.max_turnos, 6);
+        assert_eq!(config.historico.max_chars_por_turno, 2000);
+    }
+
+    #[test]
+    fn historico_max_turnos_zero_vira_um() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"historico":{"habilitado":true,"max_turnos":0}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.historico.max_turnos, 1);
     }
 
     #[test]

@@ -91,6 +91,7 @@ fn modo_sombra_ao_vivo_nao_pula_e_registra_a_economia() {
             },
         ],
         disjuntor: cfg_dj,
+        historico: Default::default(),
         telemetria_log: telemetria_log.clone(),
     };
 

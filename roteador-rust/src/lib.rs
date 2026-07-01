@@ -16,6 +16,7 @@ pub mod diagnostico;
 pub mod disjuntor;
 pub mod duracao;
 pub mod erro;
+pub mod historico;
 pub mod http;
 pub mod https;
 pub mod json;
@@ -433,6 +434,7 @@ mod testes {
             ordem_fallback: vec![],
             provedores: vec![],
             disjuntor: Default::default(),
+            historico: Default::default(),
             telemetria_log: LOG_TESTE.to_string(),
         };
         let erro = rotear("oi", &Contexto::vazio(), &config).unwrap_err();

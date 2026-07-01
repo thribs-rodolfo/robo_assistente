@@ -108,6 +108,7 @@ fn openai_compat_local_http_roteia_sem_chave() {
             retentativa_espera_ms: 250,
         }],
         disjuntor: Default::default(),
+        historico: Default::default(),
         telemetria_log: std::env::temp_dir()
             .join("roteador-integracao-openai-compat-local.log")
             .to_string_lossy()

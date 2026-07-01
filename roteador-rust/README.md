@@ -46,6 +46,7 @@ e citar o nome na `ordem_fallback`.
 | `http.rs`       | HTTP/1.1 cru sobre TcpStream (sem TLS), com timeouts + decodifica `chunked` |
 | `https.rs`      | HTTPS via `curl` (binário externo), espelha a interface do http |
 | `prompt.rs`     | Monta prompt/mensagens/conversa a partir de (mensagem, contexto) |
+| `historico.rs`  | Memória curta de conversa por chat (últimos turnos em disco) — opt-in |
 | `erro.rs`       | Erros tipados: `FalhaProvedor`, `ErroRoteador`                  |
 | `config.rs`     | Lê a config JSON dos provedores (fora do repo)                  |
 | `provedor.rs`   | Trait `Provedor` + Ollama, Claude CLI, Groq, Gemini, resposta fixa |
@@ -300,6 +301,43 @@ de 5s, pois estamos no caminho de uma mensagem viva). Cada retentativa sai na te
 **Desligado por padrão:** `retentativas` é por provedor e vale **0** quando ausente — uma
 tentativa só, comportamento idêntico ao de antes, sem latência extra. Campos (por provedor,
 opcionais): `retentativas` (0), `retentativa_espera_ms` (250).
+
+## Memória curta de conversa (`historico`)
+
+**Problema que resolve:** cada mensagem era roteada **sem contexto** — o `Contexto.historico`
+ia sempre vazio, então o modelo respondia como se nunca tivesse falado com você. Um "e o
+segundo?" ou "explica melhor", que dependem do que veio ANTES, ficavam sem sentido.
+
+**Como funciona:** quando ligada, a ponte guarda os últimos turnos de **cada chat** num arquivo
+por chat (`<diretorio>/<chat>.json`) e os devolve como histórico na próxima mensagem. O ciclo
+(no `ponte::processar`) é: **carregar** o histórico do disco → **rotear** com ele como contexto
+→ ao responder com sucesso, **gravar** a nova troca (usuário + assistente).
+
+**Cuidados de desenho (`historico.rs`):**
+
+- **Limitado**: só os últimos `max_turnos` turnos, cada um truncado em `max_chars_por_turno` —
+  memória curta não cresce sem teto (nem no disco, nem no tamanho/custo do prompt).
+- **Um arquivo por chat**: chats diferentes nunca disputam o mesmo arquivo; a gravação é
+  **atômica** (`arquivo::escrever_atomico`) para o caso de duas mensagens do mesmo chat quase
+  juntas (a ponte atende cada update numa thread).
+- **Degrada com graça**: arquivo ausente = conversa nova (histórico vazio); arquivo corrompido =
+  histórico vazio + aviso no `stderr`. A memória é um EXTRA — jamais impede uma resposta. Só uma
+  resposta **real** entra na memória (a de cortesia do erro NÃO entra, para não poluir o contexto).
+
+**Desligada por padrão:** bloco `historico` opcional. Ausente/`habilitado:false` = a ponte nem
+chama o módulo → comportamento idêntico ao de antes (risco zero na ponte viva). Para ligar:
+
+```json
+"historico": {
+  "habilitado": true,
+  "diretorio": "/var/log/roteador-historico",
+  "max_turnos": 6,
+  "max_chars_por_turno": 2000
+}
+```
+
+Campos (todos opcionais, com padrões sensatos): `diretorio` (`/var/log/roteador-historico`),
+`max_turnos` (6 = 3 trocas), `max_chars_por_turno` (2000).
 
 ## Provedor Claude CLI: leitura de resposta longa sem deadlock
 

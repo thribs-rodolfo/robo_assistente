@@ -31,5 +31,12 @@
       "timeout_segundos": 180,
       "habilitado": true
     }
+  },
+  "_comentario_historico": "Memória curta de conversa por chat. Opcional; ausente/habilitado=false => sem memória (comportamento antigo). Ligue para o bot lembrar dos últimos turnos.",
+  "historico": {
+    "habilitado": false,
+    "diretorio": "/var/log/roteador-historico",
+    "max_turnos": 6,
+    "max_chars_por_turno": 2000
   }
 }

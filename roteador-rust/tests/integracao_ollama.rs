@@ -33,6 +33,7 @@ fn ollama_local_responde_de_verdade() {
             retentativa_espera_ms: 250,
         }],
         disjuntor: Default::default(),
+        historico: Default::default(),
         // Telemetria para arquivo temporário: não suja o log de produção (fonte das métricas).
         telemetria_log: std::env::temp_dir()
             .join("roteador-integracao-ollama.log")
