@@ -73,7 +73,8 @@ Mora **fora do repositório**, com as chaves reais, em
   "provedores": {
     "claude":       {"tipo": "claude_cli", "comando": "claude", "timeout_segundos": 120, "habilitado": true},
     "groq":         {"tipo": "openai_compat", "url_base": "https://api.groq.com/openai/v1",
-                     "modelo": "llama-3.1-8b-instant", "chave": "SUA_CHAVE", "timeout_segundos": 30, "habilitado": false},
+                     "modelo": "llama-3.1-8b-instant", "chave": "SUA_CHAVE", "timeout_segundos": 30, "habilitado": false,
+                     "retentativas": 2, "retentativa_espera_ms": 250},
     "gemini":       {"tipo": "gemini_rest", "modelo": "gemini-1.5-flash",
                      "chave": "SUA_CHAVE", "timeout_segundos": 30, "habilitado": false},
     "ollama_local": {"tipo": "ollama", "url_base": "http://127.0.0.1:11434",
@@ -134,6 +135,31 @@ Campos (todos opcionais, com padrão): `habilitado` (false), `limiar_falhas` (3)
 `cooldown_segundos` (60, cooldown BASE), `cooldown_maximo_segundos` (1800, teto do backoff),
 `caminho_estado` (`/var/log/roteador-disjuntor.estado`).
 
+## Retentativa em falhas transitórias (`retentativas`)
+
+**Problema que resolve:** um blip PASSAGEIRO num provedor bom (a rede piscou, veio um
+`503`/`429` momentâneo) fazia o roteamento cair direto para o próximo — no fim, para o piso
+Ollama, lento e fraco. Mas uma segunda tentativa logo em seguida costuma passar. Retentar no
+provedor bom antes de desistir dele = **depender menos do piso** (o objetivo do projeto).
+
+**Como funciona:** ao falhar, o roteador pergunta a `retentativa::planejar` se vale retentar.
+Só retenta falhas **transitórias**: `Rede` (socket piscou/timeout) e HTTP `408`/`429`/`500`/
+`502`/`503`/`504`. Entre as tentativas espera um **backoff exponencial** (`base·2^n`, com teto
+de 5s, pois estamos no caminho de uma mensagem viva). Cada retentativa sai na telemetria como
+`[retentativa] <nome>: <falha> — retentando (X de Y) após Zms` e é contada pelo `bin/metricas`.
+
+**O que NÃO retenta (de propósito):**
+
+- `401`/`403` (auth) e `400`/`404`/`413`/`422` (erro da mensagem): repetir na hora daria o
+  mesmo erro. Note que auth **conta** para o disjuntor mas **não** vale retentativa — as duas
+  classificações divergem aqui de propósito (`indica_provedor_indisponivel` × `vale_retentar`).
+- `Processo` (Claude via `claude --print`): um CLI caído não volta a si num respiro, e martelar
+  o Claude é justamente o que evitamos (licao-refresh-token-rotativo).
+
+**Desligado por padrão:** `retentativas` é por provedor e vale **0** quando ausente — uma
+tentativa só, comportamento idêntico ao de antes, sem latência extra. Campos (por provedor,
+opcionais): `retentativas` (0), `retentativa_espera_ms` (250).
+
 ## Uso
 
 ```sh
@@ -187,6 +213,23 @@ cadeia NÃO pagou** — é a economia do disjuntor virando número:
 ```
 
 Com o disjuntor desligado (padrão) não há pulos e essas linhas nem aparecem.
+
+### Retentativas (instabilidade absorvida)
+
+Quando a [retentativa](#retentativa-em-falhas-transitórias-retentativas) está ligada e um
+provedor sofre um blip transitório, o `rotear()` loga `[retentativa] <nome>: ... — retentando
+(X de Y) após Zms`. As métricas contam essas retentativas por provedor (coluna `N retentativa`,
+só aparece quando há alguma) e somam numa linha-resumo. **Cada retentativa é um blip passageiro
+que a cadeia absorveu** em vez de cair pro piso — quanto mais alto, mais instável a rede ou os
+provedores remotos andaram:
+
+```
+# - groq: 5 ok, 0 falha, 0 pulo, 0 cfg, 3 retentativa | 900ms média
+# ...
+# retentativas transitórias (blips absorvidos): 3
+```
+
+Com a retentativa desligada (padrão) não há retentativas e essas linhas nem aparecem.
 
 ### Frescor: há quanto tempo cada provedor bom respondeu
 

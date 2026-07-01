@@ -40,6 +40,14 @@ pub struct ConfigProvedor {
     pub timeout: Duration,
     /// Se `false`, o provedor é pulado na pré-checagem (não tenta nem a rede).
     pub habilitado: bool,
+    /// Quantas RE-tentativas (além da 1ª) fazer neste provedor quando a falha é TRANSITÓRIA
+    /// (blip de rede, 429, 5xx). Padrão 0 = comportamento antigo (uma tentativa só). Ver
+    /// [`crate::retentativa`]. Falhas não-transitórias (auth, mensagem, processo) nunca
+    /// retentam, mesmo com este número alto.
+    pub retentativas: u32,
+    /// Espera-base (ms) do backoff exponencial entre retentativas: base·2^n. Padrão 250ms.
+    /// Só tem efeito quando `retentativas > 0`.
+    pub retentativa_espera_ms: u64,
 }
 
 /// Ajustes do disjuntor (circuit breaker) — ver [`crate::disjuntor`].
@@ -225,6 +233,20 @@ fn interpretar_provedor(nome: &str, valor: &Valor) -> Result<ConfigProvedor, Err
         .and_then(Valor::como_booleano)
         .unwrap_or(true);
 
+    // Retentativas: opcional, padrão 0 (sem retentativa = comportamento antigo). Negativo
+    // não faz sentido; `max(0.0)` protege contra config invertida.
+    let retentativas = valor
+        .obter("retentativas")
+        .and_then(Valor::como_numero)
+        .map(|n| n.max(0.0) as u32)
+        .unwrap_or(0);
+    // Espera-base do backoff: opcional, padrão 250ms. Mínimo 1ms para não virar "dormir 0".
+    let retentativa_espera_ms = valor
+        .obter("retentativa_espera_ms")
+        .and_then(Valor::como_numero)
+        .map(|n| n.max(1.0) as u64)
+        .unwrap_or(250);
+
     let texto_opcional = |chave: &str| {
         valor
             .obter(chave)
@@ -241,6 +263,8 @@ fn interpretar_provedor(nome: &str, valor: &Valor) -> Result<ConfigProvedor, Err
         chave: texto_opcional("chave"),
         timeout: Duration::from_secs(timeout_segundos),
         habilitado,
+        retentativas,
+        retentativa_espera_ms,
     })
 }
 
@@ -326,6 +350,25 @@ mod testes {
         let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"telemetria_log":"/tmp/x.log"}"#;
         let config = interpretar(bruto).unwrap();
         assert_eq!(config.telemetria_log, "/tmp/x.log");
+    }
+
+    #[test]
+    fn retentativas_ausentes_ficam_zero_por_padrao() {
+        // Sem configurar, o comportamento é o antigo: nenhuma retentativa.
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}}}"#;
+        let config = interpretar(bruto).unwrap();
+        let g = config.provedor("g").unwrap();
+        assert_eq!(g.retentativas, 0);
+        assert_eq!(g.retentativa_espera_ms, 250);
+    }
+
+    #[test]
+    fn retentativas_sao_lidas_quando_presentes() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"openai_compat","retentativas":3,"retentativa_espera_ms":500}}}"#;
+        let config = interpretar(bruto).unwrap();
+        let g = config.provedor("g").unwrap();
+        assert_eq!(g.retentativas, 3);
+        assert_eq!(g.retentativa_espera_ms, 500);
     }
 
     #[test]

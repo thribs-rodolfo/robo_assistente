@@ -64,6 +64,55 @@ impl FalhaProvedor {
             FalhaProvedor::Indisponivel(_) => false,
         }
     }
+
+    /// Vale a pena RE-tentar esta falha no MESMO provedor antes de cair para o próximo?
+    ///
+    /// Serve à retentativa (ver [`crate::retentativa`]): um blip PASSAGEIRO (a rede piscou,
+    /// o servidor devolveu 503 por um instante, estourou uma cota momentânea) costuma passar
+    /// numa segunda tentativa logo em seguida. Retentar no provedor bom evita jogar o robô no
+    /// piso (Ollama) por causa de uma falha que já teria sumido — exatamente o objetivo do
+    /// projeto: depender MENOS do piso.
+    ///
+    /// **Cuidado — isto é DIFERENTE de [`indica_provedor_indisponivel`](Self::indica_provedor_indisponivel).**
+    /// Aquela pergunta "devo PARAR de tentar este provedor por um tempo?" (disjuntor); esta
+    /// pergunta "uma tentativa IMEDIATA a mais tem chance de dar certo?". Por isso divergem:
+    /// - `401`/`403` (auth): o provedor está indisponível (conta pro disjuntor), mas uma
+    ///   retentativa imediata NÃO ajuda — o token continua ruim por milissegundos. **Não retenta.**
+    /// - [`FalhaProvedor::Processo`] (`claude --print`): um CLI caído/travado não volta a si
+    ///   num respiro; além disso, martelar o Claude é justamente o que evitamos
+    ///   (licao-refresh-token-rotativo). **Não retenta.**
+    ///
+    /// Classificação (por que cada uma):
+    /// - [`FalhaProvedor::Rede`] → conexão piscou/timeout de socket: clássico caso transitório.
+    ///   **Retenta.**
+    /// - [`FalhaProvedor::Http`] → só os status TRANSITÓRIOS: `408` (timeout), `429` (rate
+    ///   limit — costuma liberar rápido), `500`/`502`/`503`/`504` (erro/indisponibilidade
+    ///   momentânea do servidor). **Retenta.** Os demais (`400`/`404`/`413`/`422` da mensagem,
+    ///   `401`/`403` de auth) **não retenta** — repetir daria o mesmo erro.
+    /// - [`FalhaProvedor::Processo`] → **não retenta** (ver cuidado acima).
+    /// - [`FalhaProvedor::RespostaVazia`]/[`FalhaProvedor::RespostaInvalida`] → o provedor
+    ///   respondeu; repetir o mesmo prompt tende ao mesmo resultado. **Não retenta.**
+    /// - [`FalhaProvedor::Indisponivel`] → config/pré-checagem (sem chave/url_base): retentar
+    ///   não conserta configuração. **Não retenta.**
+    ///
+    /// Função **pura** (não olha relógio, disco nem rede) → fácil de testar.
+    pub fn vale_retentar(&self) -> bool {
+        match self {
+            FalhaProvedor::Rede(_) => true,
+            FalhaProvedor::Http { status, .. } => status_transitorio(*status),
+            FalhaProvedor::Processo(_) => false,
+            FalhaProvedor::RespostaVazia => false,
+            FalhaProvedor::RespostaInvalida(_) => false,
+            FalhaProvedor::Indisponivel(_) => false,
+        }
+    }
+}
+
+/// Um status HTTP TRANSITÓRIO: a mesma requisição tem chance real de passar se repetida
+/// logo em seguida (timeout, rate limit, erro/indisponibilidade momentânea do servidor).
+/// Note que `401`/`403` NÃO entram: são auth, que uma retentativa imediata não resolve.
+fn status_transitorio(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// Um status HTTP que representa problema DA requisição atual (não do provedor em si).
@@ -172,5 +221,63 @@ mod testes {
         assert!(!FalhaProvedor::RespostaInvalida("sem campo".into()).indica_provedor_indisponivel());
         // Config (sem chave/url_base) não é saúde do provedor no ar.
         assert!(!FalhaProvedor::Indisponivel("sem chave".into()).indica_provedor_indisponivel());
+    }
+
+    #[test]
+    fn falhas_transitorias_valem_retentar() {
+        // Rede piscou e status momentâneos do servidor: repetir tem chance de passar.
+        assert!(FalhaProvedor::Rede("conexão recusada".into()).vale_retentar());
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(
+                FalhaProvedor::Http {
+                    status,
+                    corpo: String::new(),
+                }
+                .vale_retentar(),
+                "HTTP {status} devia valer retentativa (transitório)"
+            );
+        }
+    }
+
+    #[test]
+    fn falhas_nao_transitorias_nao_valem_retentar() {
+        // Auth: repetir imediato dá o mesmo erro (token continua ruim).
+        for status in [401, 403] {
+            assert!(
+                !FalhaProvedor::Http {
+                    status,
+                    corpo: String::new(),
+                }
+                .vale_retentar(),
+                "HTTP {status} (auth) NÃO devia valer retentativa"
+            );
+        }
+        // Falhas da mensagem: repetir o mesmo pedido dá o mesmo erro.
+        for status in [400, 404, 413, 422] {
+            assert!(!FalhaProvedor::Http {
+                status,
+                corpo: String::new(),
+            }
+            .vale_retentar());
+        }
+        // Processo (Claude CLI): não martelar; um CLI caído não volta a si num respiro.
+        assert!(!FalhaProvedor::Processo("código 1".into()).vale_retentar());
+        assert!(!FalhaProvedor::RespostaVazia.vale_retentar());
+        assert!(!FalhaProvedor::RespostaInvalida("sem campo".into()).vale_retentar());
+        assert!(!FalhaProvedor::Indisponivel("sem chave".into()).vale_retentar());
+    }
+
+    #[test]
+    fn retentar_e_disjuntor_divergem_em_auth_e_processo() {
+        // Documenta em teste a diferença deliberada entre as duas classificações:
+        // 401/403 e Processo contam pro disjuntor (provedor indisponível), mas NÃO valem
+        // retentativa imediata (repetir na hora não ajuda).
+        let auth = FalhaProvedor::Http {
+            status: 401,
+            corpo: String::new(),
+        };
+        assert!(auth.indica_provedor_indisponivel() && !auth.vale_retentar());
+        let processo = FalhaProvedor::Processo("token caiu".into());
+        assert!(processo.indica_provedor_indisponivel() && !processo.vale_retentar());
     }
 }

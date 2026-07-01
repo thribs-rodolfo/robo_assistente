@@ -28,6 +28,8 @@ fn ollama_local_responde_de_verdade() {
             chave: None,
             timeout: Duration::from_secs(120),
             habilitado: true,
+            retentativas: 0,
+            retentativa_espera_ms: 250,
         }],
         disjuntor: Default::default(),
         // Telemetria para arquivo temporário: não suja o log de produção (fonte das métricas).

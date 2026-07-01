@@ -401,6 +401,8 @@ mod testes {
             chave: None,
             timeout: Duration::from_secs(5),
             habilitado,
+            retentativas: 0,
+            retentativa_espera_ms: 250,
         }
     }
 

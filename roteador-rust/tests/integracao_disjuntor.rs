@@ -43,6 +43,8 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
                 chave: None,
                 timeout: Duration::from_secs(2),
                 habilitado: true,
+                retentativas: 0,
+                retentativa_espera_ms: 250,
             },
             ConfigProvedor {
                 nome: "ollama_local".into(),
@@ -53,6 +55,8 @@ fn disjuntor_abre_o_topo_falho_em_cadeia_real() {
                 chave: None,
                 timeout: Duration::from_secs(120),
                 habilitado: true,
+                retentativas: 0,
+                retentativa_espera_ms: 250,
             },
         ],
         disjuntor: ConfigDisjuntor {

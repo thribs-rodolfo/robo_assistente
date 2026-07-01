@@ -21,6 +21,7 @@ pub mod metricas;
 pub mod ponte;
 pub mod prompt;
 pub mod provedor;
+pub mod retentativa;
 pub mod servidor_http;
 pub mod telemetria;
 pub mod verificacao;
@@ -118,10 +119,19 @@ pub fn rotear(
             continue;
         }
 
-        // Tentativa real. Medimos a latência para a telemetria (custo/performance):
-        // saber QUANTO cada provedor demora é tão útil quanto saber QUEM respondeu.
+        // Tentativa real, com RE-tentativas em falhas TRANSITÓRIAS (blip de rede, 429, 5xx)
+        // antes de cair pro próximo. Retentar no provedor bom evita jogar o robô no piso por
+        // uma falha passageira. Com `retentativas: 0` (padrão), é uma tentativa só = o
+        // comportamento antigo, sem custo de latência extra. Medimos a latência de TODA a
+        // sequência (tentativa + retentativas) para a telemetria de custo/performance.
         let inicio = std::time::Instant::now();
-        let resultado = provedor.responder(mensagem, contexto);
+        let resultado = tentar_com_retentativas(
+            provedor.as_ref(),
+            mensagem,
+            contexto,
+            config_provedor,
+            &config.telemetria_log,
+        );
         let ms = inicio.elapsed().as_millis();
         match resultado {
             Ok(texto) => {
@@ -183,6 +193,52 @@ pub fn rotear(
     Err(ErroRoteador::TodosFalharam(motivos))
 }
 
+/// Tenta um provedor, RE-tentando em falhas transitórias antes de desistir.
+///
+/// Chama `responder`; se falhar, pergunta a [`retentativa::planejar`] se vale retentar (e
+/// quanto esperar). Se sim, registra `[retentativa]` na telemetria, dorme o backoff e tenta
+/// de novo; se não (orçamento esgotado ou falha não-transitória), devolve a falha para o
+/// [`rotear`] cair para o próximo provedor.
+///
+/// A decisão de retentar é pura (testada em [`crate::retentativa`]); aqui fica só o efeito
+/// colateral (dormir + logar), fino e direto.
+fn tentar_com_retentativas(
+    provedor: &dyn Provedor,
+    mensagem: &str,
+    contexto: &Contexto,
+    config_provedor: &config::ConfigProvedor,
+    telemetria_log: &str,
+) -> Result<String, FalhaProvedor> {
+    let nome = &config_provedor.nome;
+    let mut tentativa: u32 = 0;
+    loop {
+        match provedor.responder(mensagem, contexto) {
+            Ok(texto) => return Ok(texto),
+            Err(falha) => match retentativa::planejar(
+                &falha,
+                tentativa,
+                config_provedor.retentativas,
+                config_provedor.retentativa_espera_ms,
+            ) {
+                Some(espera) => {
+                    telemetria::registrar_em(
+                        telemetria_log,
+                        &format!(
+                            "[retentativa] {nome}: {falha} — retentando ({} de {}) após {}ms",
+                            tentativa + 1,
+                            config_provedor.retentativas,
+                            espera.as_millis()
+                        ),
+                    );
+                    std::thread::sleep(espera);
+                    tentativa += 1;
+                }
+                None => return Err(falha),
+            },
+        }
+    }
+}
+
 /// Instante atual em epoch (segundos UTC). Usado pelo disjuntor para medir o cooldown.
 /// Isolado numa função para o resto do fluxo permanecer testável com instantes fixos.
 fn instante_epoch_segundos() -> u64 {
@@ -205,6 +261,120 @@ pub fn rotear_com_config_padrao(
 mod testes {
     use super::*;
     use crate::config::interpretar;
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    /// Provedor de mentira para testar a retentativa: devolve, em ordem, as falhas da lista
+    /// `falhas_pendentes`; quando a lista esvazia, responde "ok". Conta quantas vezes foi
+    /// chamado, para provarmos que a retentativa tentou (ou NÃO tentou) o número certo de vezes.
+    struct ProvedorFalso {
+        falhas_pendentes: RefCell<Vec<FalhaProvedor>>,
+        chamadas: RefCell<u32>,
+    }
+
+    impl ProvedorFalso {
+        fn com(falhas: Vec<FalhaProvedor>) -> Self {
+            ProvedorFalso {
+                falhas_pendentes: RefCell::new(falhas),
+                chamadas: RefCell::new(0),
+            }
+        }
+    }
+
+    impl Provedor for ProvedorFalso {
+        fn nome(&self) -> &str {
+            "falso"
+        }
+        fn disponivel(&self) -> Result<(), FalhaProvedor> {
+            Ok(())
+        }
+        fn responder(&self, _m: &str, _c: &Contexto) -> Result<String, FalhaProvedor> {
+            *self.chamadas.borrow_mut() += 1;
+            let mut pendentes = self.falhas_pendentes.borrow_mut();
+            if pendentes.is_empty() {
+                Ok("resposta boa".into())
+            } else {
+                Err(pendentes.remove(0))
+            }
+        }
+    }
+
+    /// ConfigProvedor mínima para os testes de retentativa (espera curta para não travar).
+    fn config_com_retentativas(retentativas: u32) -> config::ConfigProvedor {
+        config::ConfigProvedor {
+            nome: "falso".into(),
+            tipo: "ollama".into(),
+            url_base: None,
+            modelo: None,
+            comando: None,
+            chave: None,
+            timeout: Duration::from_secs(1),
+            habilitado: true,
+            retentativas,
+            retentativa_espera_ms: 1,
+        }
+    }
+
+    const LOG_RETENTATIVA: &str = "/tmp/roteador-testes-retentativa.log";
+
+    #[test]
+    fn retenta_falha_transitoria_e_acaba_respondendo() {
+        // Dois blips de rede seguidos, com orçamento 2 -> deve retentar e vencer no fim.
+        let provedor = ProvedorFalso::com(vec![
+            FalhaProvedor::Rede("piscou".into()),
+            FalhaProvedor::Rede("piscou de novo".into()),
+        ]);
+        let cfg = config_com_retentativas(2);
+        let r = tentar_com_retentativas(&provedor, "oi", &Contexto::vazio(), &cfg, LOG_RETENTATIVA);
+        assert_eq!(r.unwrap(), "resposta boa");
+        assert_eq!(
+            *provedor.chamadas.borrow(),
+            3,
+            "1 tentativa + 2 retentativas"
+        );
+    }
+
+    #[test]
+    fn desiste_quando_estoura_o_orcamento() {
+        // Três blips, mas orçamento só 1 -> não chega ao sucesso; devolve a falha.
+        let provedor = ProvedorFalso::com(vec![
+            FalhaProvedor::Rede("1".into()),
+            FalhaProvedor::Rede("2".into()),
+            FalhaProvedor::Rede("3".into()),
+        ]);
+        let cfg = config_com_retentativas(1);
+        let r = tentar_com_retentativas(&provedor, "oi", &Contexto::vazio(), &cfg, LOG_RETENTATIVA);
+        assert!(r.is_err());
+        assert_eq!(
+            *provedor.chamadas.borrow(),
+            2,
+            "1 tentativa + 1 retentativa"
+        );
+    }
+
+    #[test]
+    fn nao_retenta_falha_nao_transitoria() {
+        // Processo (Claude CLI): não deve retentar mesmo com orçamento alto (nem martelar).
+        let provedor = ProvedorFalso::com(vec![FalhaProvedor::Processo("token caiu".into())]);
+        let cfg = config_com_retentativas(5);
+        let r = tentar_com_retentativas(&provedor, "oi", &Contexto::vazio(), &cfg, LOG_RETENTATIVA);
+        assert!(r.is_err());
+        assert_eq!(
+            *provedor.chamadas.borrow(),
+            1,
+            "sem retentativa em Processo"
+        );
+    }
+
+    #[test]
+    fn sem_orcamento_e_uma_tentativa_so() {
+        // Padrão do projeto (retentativas: 0): comportamento antigo, uma tentativa.
+        let provedor = ProvedorFalso::com(vec![FalhaProvedor::Rede("x".into())]);
+        let cfg = config_com_retentativas(0);
+        let r = tentar_com_retentativas(&provedor, "oi", &Contexto::vazio(), &cfg, LOG_RETENTATIVA);
+        assert!(r.is_err());
+        assert_eq!(*provedor.chamadas.borrow(), 1);
+    }
 
     /// Log temporário para os testes: mantém o roteamento HERMÉTICO e NÃO suja o log de
     /// produção (a fonte das métricas do `bin/metricas`). Antes, sem isto, cada `cargo test`

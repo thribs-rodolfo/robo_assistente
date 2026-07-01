@@ -28,6 +28,11 @@ pub struct MetricasProvedor {
     /// (`[disjuntor] <nome>: disjuntor aberto (...) — pulando`). Cada pulo é a latência de
     /// um provedor morto que a cadeia NÃO pagou — a economia que o disjuntor entrega.
     pub disjuntor_pulos: u64,
+    /// Quantas RE-tentativas transitórias este provedor sofreu (`[retentativa] <nome>: ...`).
+    /// É a atividade da retentativa: quanto maior, mais blips passageiros o provedor teve que
+    /// engolir antes de responder (ou de a cadeia cair pro próximo). Sinal de instabilidade
+    /// que a contagem de sucessos/falhas sozinha esconde.
+    pub retentativas: u64,
     /// Latência (ms) de CADA resposta com sucesso, na ordem em que apareceram no log.
     /// Guardamos a lista inteira (não só a soma) para poder tirar tanto a média quanto os
     /// percentis (p50/p95) e o máximo — a média sozinha esconde a "cauda" (o provedor que
@@ -104,6 +109,13 @@ impl Relatorio {
     /// (quantas vezes, no período, a cadeia deixou de pagar a latência de um provedor morto).
     pub fn total_pulos_disjuntor(&self) -> u64 {
         self.por_provedor.values().map(|m| m.disjuntor_pulos).sum()
+    }
+
+    /// Total de retentativas transitórias somando todos os provedores — quantos blips
+    /// passageiros a retentativa absorveu no período (quanto mais alto, mais instável a rede
+    /// ou os provedores remotos andaram).
+    pub fn total_retentativas(&self) -> u64 {
+        self.por_provedor.values().map(|m| m.retentativas).sum()
     }
 
     /// Quantas vezes caímos no provedor-piso (qualquer nome contendo "ollama").
@@ -282,6 +294,10 @@ impl Relatorio {
                     Valor::Numero(metricas.disjuntor_pulos as f64),
                 ),
                 (
+                    "retentativas".into(),
+                    Valor::Numero(metricas.retentativas as f64),
+                ),
+                (
                     "latencia_media_ms".into(),
                     latencia_ou_nulo(metricas.latencia_media_ms()),
                 ),
@@ -337,6 +353,10 @@ impl Relatorio {
             (
                 "pulos_disjuntor".into(),
                 Valor::Numero(self.total_pulos_disjuntor() as f64),
+            ),
+            (
+                "retentativas".into(),
+                Valor::Numero(self.total_retentativas() as f64),
             ),
             (
                 "linhas_ignoradas".into(),
@@ -459,6 +479,7 @@ enum Evento {
     Pulo { nome: String },
     ProblemaConfig { nome: String },
     DisjuntorPulo { nome: String },
+    Retentativa { nome: String },
 }
 
 impl Evento {
@@ -484,6 +505,7 @@ impl Evento {
             Evento::DisjuntorPulo { nome } => {
                 por_provedor.entry(nome).or_default().disjuntor_pulos += 1
             }
+            Evento::Retentativa { nome } => por_provedor.entry(nome).or_default().retentativas += 1,
         }
     }
 }
@@ -507,6 +529,7 @@ fn separar_linha(linha: &str) -> Option<(Option<u64>, &str)> {
 /// - `[falha] <nome>: <motivo> (após <N>ms) — caindo pro próximo`
 /// - `[pula] <nome>: <motivo>`
 /// - `[disjuntor] <nome>: disjuntor aberto (...) — pulando`
+/// - `[retentativa] <nome>: <falha> — retentando (X de Y) após Zms`
 /// - `<nome>: na ordem mas sem configuração` / `<nome>: tipo '...' desconhecido`
 fn classificar(corpo: &str) -> Option<Evento> {
     if let Some(resto) = corpo.strip_prefix("[ok] respondido por '") {
@@ -528,6 +551,12 @@ fn classificar(corpo: &str) -> Option<Evento> {
     // Só o pulo (circuito ABERTO) interessa como métrica de economia; fecha/reabre não são logados.
     if let Some(resto) = corpo.strip_prefix("[disjuntor] ") {
         return Some(Evento::DisjuntorPulo {
+            nome: nome_antes_dos_dois_pontos(resto)?,
+        });
+    }
+    // Retentativa transitória: `[retentativa] <nome>: <falha> — retentando (X de Y) após Zms`.
+    if let Some(resto) = corpo.strip_prefix("[retentativa] ") {
+        return Some(Evento::Retentativa {
             nome: nome_antes_dos_dois_pontos(resto)?,
         });
     }
@@ -600,9 +629,15 @@ impl std::fmt::Display for Relatorio {
             } else {
                 String::new()
             };
+            // Retentativas idem: só aparecem quando houve alguma (linha enxuta no caso comum).
+            let retentativas = if m.retentativas > 0 {
+                format!(", {} retentativa", m.retentativas)
+            } else {
+                String::new()
+            };
             writeln!(
                 f,
-                "- {nome}: {} ok, {} falha, {} pulo, {} cfg{disjuntor} | {latencia}",
+                "- {nome}: {} ok, {} falha, {} pulo, {} cfg{disjuntor}{retentativas} | {latencia}",
                 m.sucessos, m.falhas, m.pulos, m.problemas_config
             )?;
         }
@@ -613,6 +648,14 @@ impl std::fmt::Display for Relatorio {
             writeln!(
                 f,
                 "provedores pulados por disjuntor (latência de morto evitada): {pulos_disjuntor}"
+            )?;
+        }
+        // Retentativas: só reporta se houve alguma (blips passageiros absorvidos no período).
+        let retentativas = self.total_retentativas();
+        if retentativas > 0 {
+            writeln!(
+                f,
+                "retentativas transitórias (blips absorvidos): {retentativas}"
             )?;
         }
         let piso = self.sucessos_no_piso();
@@ -687,6 +730,27 @@ mod testes {
             Some(Evento::ProblemaConfig { nome }) if nome == "gemini"
         ));
         assert!(classificar("linha aleatória qualquer").is_none());
+        // A linha de retentativa deve ter um lar (não cair em "ignoradas").
+        assert!(matches!(
+            classificar("[retentativa] groq: rede: piscou — retentando (1 de 2) após 250ms"),
+            Some(Evento::Retentativa { nome }) if nome == "groq"
+        ));
+    }
+
+    #[test]
+    fn conta_retentativas_por_provedor_e_no_total() {
+        // groq sofre 2 blips transitórios (retentativas), depois responde. A retentativa não
+        // é sucesso nem falha: é uma dimensão própria, e não deve virar "linha ignorada".
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [retentativa] groq: rede: piscou — retentando (1 de 2) após 250ms
+2026-06-30 12:00:01 UTC [roteador] [retentativa] groq: http 503:  — retentando (2 de 2) após 500ms
+2026-06-30 12:00:02 UTC [roteador] [ok] respondido por 'groq' em 900ms
+";
+        let r = agregar(log);
+        assert_eq!(r.por_provedor["groq"].retentativas, 2);
+        assert_eq!(r.por_provedor["groq"].sucessos, 1);
+        assert_eq!(r.total_retentativas(), 2);
+        assert_eq!(r.linhas_ignoradas, 0, "retentativa tem lar, não é ruído");
     }
 
     #[test]
