@@ -6,11 +6,14 @@
 //!   metricas --janela 24h          # só as últimas 24 horas (aceita 90m, 24h, 7d)
 //!   metricas --janela 6h /tmp/x.log
 //!   metricas --custo claude=3 --custo gemini=0.5   # estima custo por provedor
+//!   metricas --json                # saída legível por máquina (dashboard/outro programa)
+//!   metricas --json --janela 24h --custo claude=3   # combina com as demais opções
 //!
 //! Responde, de forma legível, "de quem o robô realmente depende?": por provedor,
 //! quantas vezes respondeu/falhou/foi pulado e a latência média; quantas vezes caímos
 //! no piso (Ollama); e a sequência de quedas seguidas no piso (alarme de dependência).
-//! Só LÊ o log — nunca dispara provedor, então é seguro rodar à vontade.
+//! Com `--json`, o MESMO conteúdo sai como um objeto JSON (uma linha) para outra
+//! ferramenta consumir. Só LÊ o log — nunca dispara provedor, então é seguro rodar à vontade.
 //!
 //! Saída de processo: 0 em sucesso, 1 se não conseguir ler o log ou se o argumento for inválido.
 
@@ -52,6 +55,13 @@ fn main() -> ExitCode {
 
     match resultado {
         Ok(relatorio) => {
+            // Modo máquina: um objeto JSON em uma linha, nada de texto humano em volta
+            // (senão não seria JSON válido para quem consome). O bloco `custo` entra só se
+            // houve `--custo`, igual ao relatório de texto.
+            if opcoes.json {
+                println!("{}", relatorio.para_json(&opcoes.precos).para_texto());
+                return ExitCode::SUCCESS;
+            }
             if let Some(janela) = opcoes.janela_segundos {
                 println!("(janela: últimas {})", descrever_duracao(janela));
             }
@@ -78,6 +88,8 @@ struct Opcoes {
     /// Tabela de preços (provedor -> custo por resposta) vinda dos `--custo nome=valor`.
     /// Vazia quando não foi passado nenhum: aí o relatório não mostra custo.
     precos: BTreeMap<String, f64>,
+    /// `true` quando `--json`: imprime o relatório como JSON (máquina) em vez de texto.
+    json: bool,
 }
 
 /// Interpreta os argumentos: `--janela <dur>` (em qualquer posição) e, opcionalmente, um caminho.
@@ -86,11 +98,15 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
     let mut caminho: Option<String> = None;
     let mut janela_segundos: Option<u64> = None;
     let mut precos: BTreeMap<String, f64> = BTreeMap::new();
+    let mut json = false;
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--janela" || arg == "-j" {
+        if arg == "--json" {
+            json = true;
+            i += 1;
+        } else if arg == "--janela" || arg == "-j" {
             let valor = args
                 .get(i + 1)
                 .ok_or_else(|| format!("{arg} precisa de um valor (ex.: 24h, 90m, 7d)"))?;
@@ -124,6 +140,7 @@ fn interpretar_argumentos(args: &[String]) -> Result<Opcoes, String> {
         caminho: caminho.unwrap_or_else(|| telemetria::ARQUIVO_LOG.to_string()),
         janela_segundos,
         precos,
+        json,
     })
 }
 
@@ -180,6 +197,28 @@ mod testes {
         assert_eq!(o.caminho, telemetria::ARQUIVO_LOG);
         assert_eq!(o.janela_segundos, None);
         assert!(o.precos.is_empty());
+        assert!(!o.json); // sem --json, saída é texto humano
+    }
+
+    #[test]
+    fn flag_json_liga_saida_de_maquina_e_combina() {
+        let o = interpretar_argumentos(&["--json".into()]).unwrap();
+        assert!(o.json);
+
+        // --json convive com --janela, caminho e --custo em qualquer ordem.
+        let o2 = interpretar_argumentos(&[
+            "--janela".into(),
+            "24h".into(),
+            "--json".into(),
+            "/tmp/x.log".into(),
+            "--custo".into(),
+            "claude=3".into(),
+        ])
+        .unwrap();
+        assert!(o2.json);
+        assert_eq!(o2.janela_segundos, Some(86_400));
+        assert_eq!(o2.caminho, "/tmp/x.log");
+        assert_eq!(o2.precos.get("claude"), Some(&3.0));
     }
 
     #[test]

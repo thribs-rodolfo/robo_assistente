@@ -182,6 +182,33 @@ antigo). **Limitação honesta:** o log guarda QUEM respondeu, não o tamanho da
 tokens — então o custo é **por resposta**, uma aproximação de dependência-em-dinheiro, não
 a fatura exata.
 
+### Saída para máquina (`--json`)
+
+O relatório de texto é para o humano ler. Com `--json`, o **mesmo conteúdo** sai como um
+objeto JSON em uma linha — para um dashboard, um alerta externo ou outro programa consumir
+sem ter que parsear texto solto:
+
+```sh
+./target/release/metricas --json
+# {"total_roteamentos":7,"caiu_no_piso":6,"percentual_no_piso":85.71...,
+#  "sequencia_atual_no_piso":3,"maior_sequencia_no_piso":3,"pulos_disjuntor":25,
+#  "linhas_ignoradas":12,"provedores":{"claude":{"sucessos":1,...,"latencia_media_ms":42322,
+#  "latencia_p50_ms":42322,"latencia_p95_ms":42322,"latencia_maxima_ms":42322}, ...}}
+```
+
+O `--json` combina com `--janela` e `--custo` (o bloco `custo` só entra se houver `--custo`,
+igual ao relatório de texto). Detalhes que valem notar:
+
+- Latência de um provedor que **nunca respondeu** vira `null`, não `0` — `0ms` seria mentira.
+- A saída é **só** o JSON (nada de texto humano em volta), para continuar sendo JSON válido.
+- Continua **só leitura** do log: nunca dispara provedor. Serializado pelo nosso próprio
+  codificador JSON (`json.rs`), zero dependências.
+
+```sh
+# Ex.: extrair o percentual no piso das últimas 24h com jq
+./target/release/metricas --json --janela 24h | jq .percentual_no_piso
+```
+
 > Nota: linhas no formato ANTIGO do roteador Python (`... ,177 INFO [roteador]
 > respondido por '...'`) são **ignoradas de propósito** (schema diferente) e contadas
 > em "linhas ignoradas" — sem truncar em silêncio. A telemetria nova é toda em Rust.

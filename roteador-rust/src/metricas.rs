@@ -172,6 +172,113 @@ impl Relatorio {
         Some(texto)
     }
 
+    /// Serializa o relatório inteiro como um [`Valor`](crate::json::Valor) JSON — a MESMA
+    /// informação que o [`Display`](std::fmt::Display) mostra ao humano, mas legível por
+    /// máquina (dashboard, alerta externo, outro programa que consome o log).
+    ///
+    /// A `tabela` de preços é opcional, igual ao relatório de texto: quando vazia, o bloco
+    /// `custo` simplesmente não aparece (espelha o comportamento de rodar sem `--custo`).
+    ///
+    /// Função PURA: monta um `Valor` a partir do que já está no relatório — não lê disco,
+    /// não dispara provedor nenhum (portanto jamais toca o Claude). Latências que não
+    /// existem (provedor que nunca respondeu) viram `null`, não `0` — `0ms` seria mentira.
+    pub fn para_json(&self, tabela: &BTreeMap<String, f64>) -> crate::json::Valor {
+        use crate::json::Valor;
+
+        // Option<u128> -> Valor: número quando há amostra, `null` quando o provedor nunca
+        // respondeu (distingue "0ms" de "sem dado" — honestidade na telemetria).
+        let latencia_ou_nulo = |valor: Option<u128>| match valor {
+            Some(ms) => Valor::Numero(ms as f64),
+            None => Valor::Nulo,
+        };
+
+        // Um objeto por provedor. Iteramos o BTreeMap (já ordenado por nome) → saída
+        // determinística, boa para diff e para testes.
+        let mut provedores: Vec<(String, Valor)> = Vec::new();
+        for (nome, metricas) in &self.por_provedor {
+            let objeto_provedor = Valor::Objeto(vec![
+                ("sucessos".into(), Valor::Numero(metricas.sucessos as f64)),
+                ("falhas".into(), Valor::Numero(metricas.falhas as f64)),
+                ("pulos".into(), Valor::Numero(metricas.pulos as f64)),
+                (
+                    "problemas_config".into(),
+                    Valor::Numero(metricas.problemas_config as f64),
+                ),
+                (
+                    "disjuntor_pulos".into(),
+                    Valor::Numero(metricas.disjuntor_pulos as f64),
+                ),
+                (
+                    "latencia_media_ms".into(),
+                    latencia_ou_nulo(metricas.latencia_media_ms()),
+                ),
+                (
+                    "latencia_p50_ms".into(),
+                    latencia_ou_nulo(metricas.latencia_percentil(50)),
+                ),
+                (
+                    "latencia_p95_ms".into(),
+                    latencia_ou_nulo(metricas.latencia_percentil(95)),
+                ),
+                (
+                    "latencia_maxima_ms".into(),
+                    latencia_ou_nulo(metricas.latencia_maxima_ms()),
+                ),
+            ]);
+            provedores.push((nome.clone(), objeto_provedor));
+        }
+
+        // Campos de topo em ordem LÓGICA (não alfabética) — assim o JSON também fica legível
+        // para um humano que der uma olhada, espelhando a ordem do relatório de texto.
+        let mut campos: Vec<(String, Valor)> = vec![
+            (
+                "total_roteamentos".into(),
+                Valor::Numero(self.total_roteamentos() as f64),
+            ),
+            (
+                "caiu_no_piso".into(),
+                Valor::Numero(self.sucessos_no_piso() as f64),
+            ),
+            (
+                "percentual_no_piso".into(),
+                Valor::Numero(self.percentual_no_piso()),
+            ),
+            (
+                "sequencia_atual_no_piso".into(),
+                Valor::Numero(self.sequencia_atual_no_piso as f64),
+            ),
+            (
+                "maior_sequencia_no_piso".into(),
+                Valor::Numero(self.maior_sequencia_no_piso as f64),
+            ),
+            (
+                "pulos_disjuntor".into(),
+                Valor::Numero(self.total_pulos_disjuntor() as f64),
+            ),
+            (
+                "linhas_ignoradas".into(),
+                Valor::Numero(self.linhas_ignoradas as f64),
+            ),
+            ("provedores".into(), Valor::Objeto(provedores)),
+        ];
+
+        // Bloco de custo só quando há tabela de preços (mesma regra do relatório de texto).
+        if !tabela.is_empty() {
+            let por_provedor_custo: Vec<(String, Valor)> = self
+                .custo_por_provedor(tabela)
+                .into_iter()
+                .map(|(nome, custo)| (nome, Valor::Numero(custo)))
+                .collect();
+            let custo = Valor::Objeto(vec![
+                ("por_provedor".into(), Valor::Objeto(por_provedor_custo)),
+                ("total".into(), Valor::Numero(self.custo_total(tabela))),
+            ]);
+            campos.push(("custo".into(), custo));
+        }
+
+        Valor::Objeto(campos)
+    }
+
     /// Atualiza as sequências de "caiu no piso" a cada `[ok]`, na ordem cronológica do log.
     /// Cada resposta de provedor bom zera a sequência atual; cada Ollama soma +1.
     fn registrar_sequencia(&mut self, nome: &str) {
@@ -728,5 +835,71 @@ linha de ruído sem formato
         assert_eq!(r.percentual_no_piso(), 75.0);
         // Sem roteamento nenhum, não divide por zero: fica 0%.
         assert_eq!(agregar("").percentual_no_piso(), 0.0);
+    }
+
+    #[test]
+    fn para_json_espelha_o_relatorio_e_faz_round_trip() {
+        // claude respondeu 1x, ollama 2x -> 2 de 3 no piso.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 800ms
+2026-06-30 12:01:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:02:00 UTC [roteador] [ok] respondido por 'ollama_local' em 32000ms
+";
+        let relatorio = agregar(log);
+        let tabela = BTreeMap::new(); // sem preços -> sem bloco "custo"
+                                      // Serializa e re-parseia com nosso próprio parser (garante JSON válido de verdade).
+        let texto = relatorio.para_json(&tabela).para_texto();
+        let valor = crate::json::parsear(&texto).expect("JSON gerado deve ser válido");
+
+        // Campos de topo batem com os métodos do relatório.
+        assert_eq!(
+            valor.obter("total_roteamentos").unwrap().como_numero(),
+            Some(3.0)
+        );
+        assert_eq!(
+            valor.obter("caiu_no_piso").unwrap().como_numero(),
+            Some(2.0)
+        );
+        assert_eq!(
+            valor.obter("percentual_no_piso").unwrap().como_numero(),
+            Some(relatorio.percentual_no_piso())
+        );
+
+        // O provedor claude aparece com 1 sucesso e latência média 800ms.
+        let provedores = valor.obter("provedores").unwrap();
+        let claude = provedores.obter("claude").unwrap();
+        assert_eq!(claude.obter("sucessos").unwrap().como_numero(), Some(1.0));
+        assert_eq!(
+            claude.obter("latencia_media_ms").unwrap().como_numero(),
+            Some(800.0)
+        );
+
+        // Sem tabela de preços, o bloco de custo NÃO existe (espelha o relatório de texto).
+        assert!(valor.obter("custo").is_none());
+    }
+
+    #[test]
+    fn para_json_inclui_custo_so_quando_ha_precos() {
+        let log = "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'claude' em 500ms\n";
+        let relatorio = agregar(log);
+
+        // Latência nula vira `null`, não 0, para provedor que nunca respondeu.
+        let ollama_metricas = MetricasProvedor::default();
+        assert_eq!(ollama_metricas.latencia_media_ms(), None);
+
+        let mut tabela = BTreeMap::new();
+        tabela.insert("claude".to_string(), 3.0);
+        let valor = relatorio.para_json(&tabela);
+        let custo = valor.obter("custo").expect("com preço, bloco custo existe");
+        assert_eq!(custo.obter("total").unwrap().como_numero(), Some(3.0));
+        assert_eq!(
+            custo
+                .obter("por_provedor")
+                .unwrap()
+                .obter("claude")
+                .unwrap()
+                .como_numero(),
+            Some(3.0)
+        );
     }
 }
