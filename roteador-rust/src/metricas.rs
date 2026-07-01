@@ -33,6 +33,19 @@ pub struct MetricasProvedor {
     /// engolir antes de responder (ou de a cadeia cair pro próximo). Sinal de instabilidade
     /// que a contagem de sucessos/falhas sozinha esconde.
     pub retentativas: u64,
+    /// Modo SOMBRA do disjuntor — vezes que o disjuntor ATIVO PULARIA este provedor e a
+    /// previsão estava CERTA (ele de fato falhou): `[disjuntor-sombra] pularia '<nome>' ...`.
+    /// Cada uma é um pulo que o disjuntor ligado teria dado sem prejuízo. Ver [`crate::disjuntor`].
+    pub sombra_pularia_ok: u64,
+    /// Soma (ms) da economia ESTIMADA dessas previsões certas: a latência real que cada
+    /// provedor morto gastou e que o disjuntor ligado teria poupado. É a economia do disjuntor
+    /// projetada sobre o tráfego real, ANTES de ligá-lo — a base pra decidir se vale ligar.
+    pub sombra_economia_ms: u128,
+    /// Modo SOMBRA — vezes que o disjuntor ATIVO PULARIA este provedor mas ele RESPONDEU
+    /// (FALSO POSITIVO): `[disjuntor-sombra] PULARIA '<nome>' ... mas ele RESPONDEU ...`.
+    /// Qualquer número acima de 0 é sinal de que ligar o disjuntor agora custaria respostas
+    /// boas — é o freio que impede ligar cedo demais.
+    pub sombra_falsos_positivos: u64,
     /// Latência (ms) de CADA resposta com sucesso, na ordem em que apareceram no log.
     /// Guardamos a lista inteira (não só a soma) para poder tirar tanto a média quanto os
     /// percentis (p50/p95) e o máximo — a média sozinha esconde a "cauda" (o provedor que
@@ -116,6 +129,33 @@ impl Relatorio {
     /// ou os provedores remotos andaram).
     pub fn total_retentativas(&self) -> u64 {
         self.por_provedor.values().map(|m| m.retentativas).sum()
+    }
+
+    /// Total de pulos que o disjuntor em modo SOMBRA acertaria (previsão certa) no período.
+    pub fn total_sombra_pularia_ok(&self) -> u64 {
+        self.por_provedor
+            .values()
+            .map(|m| m.sombra_pularia_ok)
+            .sum()
+    }
+
+    /// Economia (ms) ESTIMADA total do disjuntor no modo sombra — quanto de latência de
+    /// provedor morto ele teria poupado no período se estivesse LIGADO. É a projeção da
+    /// economia sobre o tráfego real, o número que ajuda a decidir se vale ligar o disjuntor.
+    pub fn total_sombra_economia_ms(&self) -> u128 {
+        self.por_provedor
+            .values()
+            .map(|m| m.sombra_economia_ms)
+            .sum()
+    }
+
+    /// Total de FALSOS POSITIVOS do modo sombra — vezes que o disjuntor pularia um provedor
+    /// que na verdade respondeu. Qualquer valor > 0 desaconselha ligar o disjuntor sem afinar.
+    pub fn total_sombra_falsos_positivos(&self) -> u64 {
+        self.por_provedor
+            .values()
+            .map(|m| m.sombra_falsos_positivos)
+            .sum()
     }
 
     /// Quantas vezes caímos no provedor-piso (qualquer nome contendo "ollama").
@@ -298,6 +338,18 @@ impl Relatorio {
                     Valor::Numero(metricas.retentativas as f64),
                 ),
                 (
+                    "sombra_pularia_ok".into(),
+                    Valor::Numero(metricas.sombra_pularia_ok as f64),
+                ),
+                (
+                    "sombra_economia_ms".into(),
+                    Valor::Numero(metricas.sombra_economia_ms as f64),
+                ),
+                (
+                    "sombra_falsos_positivos".into(),
+                    Valor::Numero(metricas.sombra_falsos_positivos as f64),
+                ),
+                (
                     "latencia_media_ms".into(),
                     latencia_ou_nulo(metricas.latencia_media_ms()),
                 ),
@@ -357,6 +409,18 @@ impl Relatorio {
             (
                 "retentativas".into(),
                 Valor::Numero(self.total_retentativas() as f64),
+            ),
+            (
+                "sombra_pularia_ok".into(),
+                Valor::Numero(self.total_sombra_pularia_ok() as f64),
+            ),
+            (
+                "sombra_economia_ms".into(),
+                Valor::Numero(self.total_sombra_economia_ms() as f64),
+            ),
+            (
+                "sombra_falsos_positivos".into(),
+                Valor::Numero(self.total_sombra_falsos_positivos() as f64),
             ),
             (
                 "linhas_ignoradas".into(),
@@ -474,12 +538,34 @@ fn agregar_interno(conteudo: &str, janela: Option<std::ops::RangeInclusive<u64>>
 
 /// Um evento já interpretado de uma linha do log, pronto para somar no mapa.
 enum Evento {
-    Sucesso { nome: String, latencia_ms: u128 },
-    Falha { nome: String },
-    Pulo { nome: String },
-    ProblemaConfig { nome: String },
-    DisjuntorPulo { nome: String },
-    Retentativa { nome: String },
+    Sucesso {
+        nome: String,
+        latencia_ms: u128,
+    },
+    Falha {
+        nome: String,
+    },
+    Pulo {
+        nome: String,
+    },
+    ProblemaConfig {
+        nome: String,
+    },
+    DisjuntorPulo {
+        nome: String,
+    },
+    Retentativa {
+        nome: String,
+    },
+    /// Modo sombra, previsão CERTA: pularia e o provedor de fato falhou (com a economia estimada).
+    SombraPulariaOk {
+        nome: String,
+        economia_ms: u128,
+    },
+    /// Modo sombra, FALSO POSITIVO: pularia mas o provedor respondeu.
+    SombraFalsoPositivo {
+        nome: String,
+    },
 }
 
 impl Evento {
@@ -506,6 +592,17 @@ impl Evento {
                 por_provedor.entry(nome).or_default().disjuntor_pulos += 1
             }
             Evento::Retentativa { nome } => por_provedor.entry(nome).or_default().retentativas += 1,
+            Evento::SombraPulariaOk { nome, economia_ms } => {
+                let m = por_provedor.entry(nome).or_default();
+                m.sombra_pularia_ok += 1;
+                m.sombra_economia_ms += economia_ms;
+            }
+            Evento::SombraFalsoPositivo { nome } => {
+                por_provedor
+                    .entry(nome)
+                    .or_default()
+                    .sombra_falsos_positivos += 1
+            }
         }
     }
 }
@@ -530,6 +627,8 @@ fn separar_linha(linha: &str) -> Option<(Option<u64>, &str)> {
 /// - `[pula] <nome>: <motivo>`
 /// - `[disjuntor] <nome>: disjuntor aberto (...) — pulando`
 /// - `[retentativa] <nome>: <falha> — retentando (X de Y) após Zms`
+/// - `[disjuntor-sombra] pularia '<nome>' ... teria economizado ~<N>ms — ele falhou como previsto`
+/// - `[disjuntor-sombra] PULARIA '<nome>' ... mas ele RESPONDEU em <N>ms — FALSO POSITIVO`
 /// - `<nome>: na ordem mas sem configuração` / `<nome>: tipo '...' desconhecido`
 fn classificar(corpo: &str) -> Option<Evento> {
     if let Some(resto) = corpo.strip_prefix("[ok] respondido por '") {
@@ -560,6 +659,25 @@ fn classificar(corpo: &str) -> Option<Evento> {
             nome: nome_antes_dos_dois_pontos(resto)?,
         });
     }
+    // Modo SOMBRA do disjuntor (dry-run). Duas formas, distinguidas pelo verbo:
+    // - `pularia '<nome>' ... teria economizado ~<ms>ms — ele falhou como previsto` (previsão certa)
+    // - `PULARIA '<nome>' ... mas ele RESPONDEU em <ms>ms — FALSO POSITIVO` (falso positivo)
+    if let Some(resto) = corpo.strip_prefix("[disjuntor-sombra] ") {
+        if let Some(depois) = resto.strip_prefix("pularia '") {
+            return Some(Evento::SombraPulariaOk {
+                nome: nome_entre_aspas(depois)?,
+                // A economia estimada é a latência que o provedor morto gastou.
+                economia_ms: extrair_latencia_ms(depois).unwrap_or(0),
+            });
+        }
+        if let Some(depois) = resto.strip_prefix("PULARIA '") {
+            return Some(Evento::SombraFalsoPositivo {
+                nome: nome_entre_aspas(depois)?,
+            });
+        }
+        // Prefixo de sombra mas forma desconhecida: não inventa evento (cai em ignoradas).
+        return None;
+    }
     // Problemas de config saem sem prefixo entre colchetes, mas com o padrão `<nome>: ...`.
     if corpo.contains("na ordem mas sem configuração") || corpo.contains("desconhecido") {
         return Some(Evento::ProblemaConfig {
@@ -573,6 +691,20 @@ fn classificar(corpo: &str) -> Option<Evento> {
 /// `None` se não houver `:` ou o nome ficar vazio.
 fn nome_antes_dos_dois_pontos(corpo: &str) -> Option<String> {
     let nome = corpo.split(':').next()?.trim();
+    if nome.is_empty() {
+        None
+    } else {
+        Some(nome.to_string())
+    }
+}
+
+/// Pega o nome até a próxima aspa simples, dado um texto que COMEÇA logo após a aspa de
+/// abertura (ex.: `topo' (circuito ...` -> `topo`). `None` se não houver aspa de fecho ou
+/// o nome ficar vazio. Usado nas linhas do modo sombra, onde o nome vem entre aspas.
+fn nome_entre_aspas(depois_da_aspa: &str) -> Option<String> {
+    // `split_once` EXIGE a aspa de fecho; sem ela, devolve None (não engole o resto da linha).
+    let (nome, _) = depois_da_aspa.split_once('\'')?;
+    let nome = nome.trim();
     if nome.is_empty() {
         None
     } else {
@@ -657,6 +789,26 @@ impl std::fmt::Display for Relatorio {
                 f,
                 "retentativas transitórias (blips absorvidos): {retentativas}"
             )?;
+        }
+        // Modo sombra do disjuntor: só reporta se houve atividade (disjuntor rodando em sombra).
+        // É a projeção "e se eu ligasse o disjuntor?": quantos pulos acertaria, quanto pouparia,
+        // e — o freio — quantos falsos positivos (pularia um provedor que respondeu).
+        let sombra_ok = self.total_sombra_pularia_ok();
+        let sombra_fp = self.total_sombra_falsos_positivos();
+        if sombra_ok > 0 || sombra_fp > 0 {
+            let economia = self.total_sombra_economia_ms();
+            writeln!(
+                f,
+                "disjuntor em sombra: pularia {sombra_ok} certo(s) (~{economia}ms poupados), {sombra_fp} falso(s) positivo(s)"
+            )?;
+            if sombra_fp == 0 {
+                writeln!(f, "  → sem falsos positivos: candidato a ligar o disjuntor")?;
+            } else {
+                writeln!(
+                    f,
+                    "  → {sombra_fp} falso(s) positivo(s): NÃO ligar ainda / subir limiar/cooldown"
+                )?;
+            }
         }
         let piso = self.sucessos_no_piso();
         let pct = self.percentual_no_piso();
@@ -917,6 +1069,72 @@ linha de ruído sem formato
         let texto = format!("{r}");
         assert!(texto.contains(", 2 disjuntor"));
         assert!(texto.contains("provedores pulados por disjuntor (latência de morto evitada): 2"));
+    }
+
+    #[test]
+    fn classifica_linhas_do_modo_sombra() {
+        // Previsão certa: pularia e o provedor falhou, com economia estimada extraída.
+        match classificar("[disjuntor-sombra] pularia 'claude' (circuito aberto, 3 falhas seguidas) e teria economizado ~1200ms — ele falhou como previsto") {
+            Some(Evento::SombraPulariaOk { nome, economia_ms }) => {
+                assert_eq!(nome, "claude");
+                assert_eq!(economia_ms, 1200);
+            }
+            outro => panic!("esperava SombraPulariaOk, veio {:?}", outro.is_some()),
+        }
+        // Falso positivo: pularia mas o provedor respondeu.
+        assert!(matches!(
+            classificar("[disjuntor-sombra] PULARIA 'gemini' (circuito aberto, 4 falhas seguidas) mas ele RESPONDEU em 900ms — FALSO POSITIVO (não ligar ainda / afinar limiar)"),
+            Some(Evento::SombraFalsoPositivo { nome }) if nome == "gemini"
+        ));
+        // Forma de sombra desconhecida não vira evento (cai em ignoradas, não inventa).
+        assert!(classificar("[disjuntor-sombra] algo estranho sem verbo conhecido").is_none());
+    }
+
+    #[test]
+    fn agrega_atividade_do_modo_sombra() {
+        // Duas previsões certas do claude (economia 1200 + 800) e um falso positivo do gemini.
+        let log = "\
+2026-06-30 12:00:00 UTC [roteador] [disjuntor-sombra] pularia 'claude' (circuito aberto, 3 falhas seguidas) e teria economizado ~1200ms — ele falhou como previsto
+2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms
+2026-06-30 12:05:00 UTC [roteador] [disjuntor-sombra] pularia 'claude' (circuito aberto, 3 falhas seguidas) e teria economizado ~800ms — ele falhou como previsto
+2026-06-30 12:05:00 UTC [roteador] [ok] respondido por 'ollama_local' em 31000ms
+2026-06-30 12:10:00 UTC [roteador] [disjuntor-sombra] PULARIA 'gemini' (circuito aberto, 5 falhas seguidas) mas ele RESPONDEU em 900ms — FALSO POSITIVO (não ligar ainda / afinar limiar)
+2026-06-30 12:10:00 UTC [roteador] [ok] respondido por 'gemini' em 900ms
+";
+        let r = agregar(log);
+        assert_eq!(r.por_provedor["claude"].sombra_pularia_ok, 2);
+        assert_eq!(r.por_provedor["claude"].sombra_economia_ms, 2000); // 1200 + 800
+        assert_eq!(r.por_provedor["gemini"].sombra_falsos_positivos, 1);
+        assert_eq!(r.total_sombra_pularia_ok(), 2);
+        assert_eq!(r.total_sombra_economia_ms(), 2000);
+        assert_eq!(r.total_sombra_falsos_positivos(), 1);
+        // Linhas de sombra têm lar: não contam como ruído.
+        assert_eq!(r.linhas_ignoradas, 0);
+
+        // O relatório mostra o resumo da sombra e, havendo falso positivo, o freio.
+        let texto = format!("{r}");
+        assert!(texto.contains(
+            "disjuntor em sombra: pularia 2 certo(s) (~2000ms poupados), 1 falso(s) positivo(s)"
+        ));
+        assert!(texto.contains("NÃO ligar ainda"));
+    }
+
+    #[test]
+    fn sombra_sem_falso_positivo_sugere_ligar() {
+        // Só previsões certas: o relatório sinaliza que o disjuntor é candidato a ser ligado.
+        let log = "2026-06-30 12:00:00 UTC [roteador] [disjuntor-sombra] pularia 'claude' (circuito aberto, 3 falhas seguidas) e teria economizado ~1500ms — ele falhou como previsto\n";
+        let texto = format!("{}", agregar(log));
+        assert!(texto.contains("candidato a ligar o disjuntor"));
+        assert!(!texto.contains("NÃO ligar"));
+    }
+
+    #[test]
+    fn sem_sombra_o_relatorio_nao_mostra_a_linha() {
+        // Caso comum (sombra desligada): nada de "sombra" na saída, para não poluir.
+        let log =
+            "2026-06-30 12:00:00 UTC [roteador] [ok] respondido por 'ollama_local' em 30000ms\n";
+        let texto = format!("{}", agregar(log));
+        assert!(!texto.contains("sombra"));
     }
 
     #[test]
