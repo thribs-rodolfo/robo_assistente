@@ -76,9 +76,34 @@ Mora **fora do repositório**, com as chaves reais, em
                      "chave": "SUA_CHAVE", "timeout_segundos": 30, "habilitado": false},
     "ollama_local": {"tipo": "ollama", "url_base": "http://127.0.0.1:11434",
                      "modelo": "qwen2.5:1.5b", "timeout_segundos": 180, "habilitado": true}
-  }
+  },
+  "disjuntor": {"habilitado": false, "limiar_falhas": 3, "cooldown_segundos": 60}
 }
 ```
+
+O bloco `disjuntor` é **opcional** e vem **desligado por padrão** (ver abaixo).
+
+## Disjuntor / circuit breaker (`disjuntor`)
+
+**Problema que resolve:** o Claude é frágil (o token OAuth cai). Com o roteamento linear
+puro, enquanto o Claude está fora, TODA mensagem tenta o Claude primeiro e paga o timeout
+inteiro antes de cair pro Ollama — lentidão à toa, mensagem após mensagem.
+
+**Como funciona:** o disjuntor lembra as falhas RECENTES de cada provedor. Depois de
+`limiar_falhas` falhas seguidas, "abre o circuito" daquele provedor por `cooldown_segundos`
+— nesse intervalo o roteador o **pula** sem gastar rede/processo. Passado o cooldown, deixa
+passar UMA tentativa ("meio-aberto"): sucesso fecha o circuito, nova falha reabre.
+
+- **O piso (Ollama local, último da ordem) NUNCA é pulado** → o robô nunca fica mudo.
+- **Estado operacional e efêmero** em `/var/log/roteador-disjuntor.estado` (fora do repo);
+  ausente/corrompido → tudo tratado como fechado (= comportamento antigo). Degrada com graça.
+- **Desligado por padrão:** sem o bloco `disjuntor` (ou com `"habilitado": false`), o
+  roteador nem lê o arquivo e o comportamento é idêntico ao de antes (risco zero).
+- Telemetria: um pulo pelo disjuntor sai como `[disjuntor] <nome>: disjuntor aberto (N
+  falhas seguidas) — pulando`.
+
+Campos (todos opcionais, com padrão): `habilitado` (false), `limiar_falhas` (3),
+`cooldown_segundos` (60), `caminho_estado` (`/var/log/roteador-disjuntor.estado`).
 
 ## Uso
 

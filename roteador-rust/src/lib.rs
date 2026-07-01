@@ -11,6 +11,7 @@
 
 pub mod alerta;
 pub mod config;
+pub mod disjuntor;
 pub mod duracao;
 pub mod erro;
 pub mod http;
@@ -59,7 +60,21 @@ pub fn rotear(
     let mut motivos: Vec<String> = Vec::new();
     let mut algum_provedor_construido = false;
 
-    for nome in &config.ordem_fallback {
+    // Disjuntor (circuit breaker): quando LIGADO na config, pulamos provedores que vêm
+    // falhando em série, sem pagar a latência deles a cada mensagem. Desligado (padrão),
+    // nada disto roda — nem lemos o arquivo — e o roteamento é idêntico ao de antes.
+    let usar_disjuntor = config.disjuntor.habilitado;
+    let agora = instante_epoch_segundos();
+    let mut estado_disjuntor = if usar_disjuntor {
+        disjuntor::EstadoDisjuntor::carregar(&config.disjuntor.caminho_estado)
+    } else {
+        disjuntor::EstadoDisjuntor::vazio()
+    };
+    // O piso (último da ordem) NUNCA é pulado pelo disjuntor: garante que o robô nunca
+    // fica mudo mesmo com todos os circuitos de cima abertos.
+    let indice_piso = config.ordem_fallback.len() - 1;
+
+    for (indice, nome) in config.ordem_fallback.iter().enumerate() {
         // Acha a config deste provedor; se faltar, anota e segue (não derruba o roteador).
         let config_provedor = match config.provedor(nome) {
             Some(c) => c,
@@ -91,6 +106,17 @@ pub fn rotear(
             continue;
         }
 
+        // Disjuntor: se o circuito deste provedor está ABERTO (vem falhando em série) e ele
+        // NÃO é o piso, pula sem gastar rede/processo — é justamente a latência que o
+        // disjuntor economiza quando um provedor de cima está fora do ar.
+        if usar_disjuntor && indice != indice_piso && estado_disjuntor.esta_aberto(nome, agora) {
+            let falhas = estado_disjuntor.falhas_de(nome);
+            let motivo = format!("{nome}: disjuntor aberto ({falhas} falhas seguidas) — pulando");
+            telemetria::registrar(&format!("[disjuntor] {motivo}"));
+            motivos.push(motivo);
+            continue;
+        }
+
         // Tentativa real. Medimos a latência para a telemetria (custo/performance):
         // saber QUANTO cada provedor demora é tão útil quanto saber QUEM respondeu.
         let inicio = std::time::Instant::now();
@@ -99,6 +125,11 @@ pub fn rotear(
         match resultado {
             Ok(texto) => {
                 telemetria::registrar(&format!("[ok] respondido por '{nome}' em {ms}ms"));
+                // Sucesso fecha o circuito (provedor voltou a si) e persiste o estado.
+                if usar_disjuntor {
+                    estado_disjuntor.apos_sucesso(nome);
+                    estado_disjuntor.salvar(&config.disjuntor.caminho_estado);
+                }
                 return Ok(RespostaRoteada {
                     texto,
                     provedor: nome.clone(),
@@ -109,15 +140,34 @@ pub fn rotear(
                 telemetria::registrar(&format!(
                     "[falha] {motivo} (após {ms}ms) — caindo pro próximo"
                 ));
+                // Registra a falha no disjuntor; se cruzar o limiar, abre o circuito.
+                if usar_disjuntor {
+                    estado_disjuntor.apos_falha(nome, agora, &config.disjuntor);
+                }
                 motivos.push(motivo);
             }
         }
+    }
+
+    // Persiste o estado do disjuntor após a cadeia (as falhas acumuladas acima). No
+    // caminho de sucesso já salvamos e retornamos antes de chegar aqui.
+    if usar_disjuntor {
+        estado_disjuntor.salvar(&config.disjuntor.caminho_estado);
     }
 
     if !algum_provedor_construido {
         return Err(ErroRoteador::SemProvedores);
     }
     Err(ErroRoteador::TodosFalharam(motivos))
+}
+
+/// Instante atual em epoch (segundos UTC). Usado pelo disjuntor para medir o cooldown.
+/// Isolado numa função para o resto do fluxo permanecer testável com instantes fixos.
+fn instante_epoch_segundos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Atalho que carrega a config do caminho padrão e roteia. Útil para o binário/ponte.
@@ -139,6 +189,7 @@ mod testes {
         let config = Config {
             ordem_fallback: vec![],
             provedores: vec![],
+            disjuntor: Default::default(),
         };
         let erro = rotear("oi", &Contexto::vazio(), &config).unwrap_err();
         assert_eq!(erro, ErroRoteador::SemProvedores);
@@ -175,5 +226,63 @@ mod testes {
             }
             outro => panic!("esperava TodosFalharam, veio {outro:?}"),
         }
+    }
+
+    #[test]
+    fn disjuntor_aberto_pula_o_topo_sem_tentar() {
+        use crate::disjuntor::EstadoDisjuntor;
+
+        // Arquivo de estado temporário com o 'topo' já ABERTO (falhando em série).
+        let caminho = std::env::temp_dir().join("roteador-lib-disjuntor-teste.estado");
+        let caminho = caminho.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&caminho);
+        let mut estado = EstadoDisjuntor::vazio();
+        let cfg_dj = crate::config::ConfigDisjuntor {
+            habilitado: true,
+            limiar_falhas: 3,
+            cooldown_segundos: 100_000,
+            caminho_estado: caminho.clone(),
+        };
+        // Ancoramos as falhas no AGORA real (o `rotear` usa o relógio real), senão o
+        // `aberto_ate` cairia no passado e o circuito já estaria fechado quando testasse.
+        let agora_real = instante_epoch_segundos();
+        for _ in 0..3 {
+            estado.apos_falha("topo", agora_real, &cfg_dj);
+        }
+        estado.salvar(&caminho);
+
+        // Ordem [topo, piso]: os dois apontam para portas mortas (falham rápido), mas o
+        // 'topo' deve ser PULADO pelo disjuntor (nem tenta a rede). O piso (último) NUNCA
+        // é pulado, então ele é tentado e falha — provando que a cadeia andou pelo disjuntor.
+        let json = format!(
+            r#"{{
+                "ordem_fallback": ["topo", "piso"],
+                "provedores": {{
+                    "topo": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}},
+                    "piso": {{"tipo":"ollama","url_base":"http://127.0.0.1:1","modelo":"m","timeout_segundos":1}}
+                }},
+                "disjuntor": {{"habilitado": true, "cooldown_segundos": 100000, "caminho_estado": "{caminho}"}}
+            }}"#
+        );
+        let config = interpretar(&json).unwrap();
+
+        match rotear("oi", &Contexto::vazio(), &config).unwrap_err() {
+            ErroRoteador::TodosFalharam(motivos) => {
+                assert_eq!(motivos.len(), 2, "topo pulado + piso tentado");
+                assert!(
+                    motivos[0].contains("disjuntor aberto"),
+                    "topo devia ser pulado pelo disjuntor, veio: {}",
+                    motivos[0]
+                );
+                assert!(
+                    motivos[1].starts_with("piso:") && !motivos[1].contains("disjuntor"),
+                    "piso nunca é pulado pelo disjuntor, veio: {}",
+                    motivos[1]
+                );
+            }
+            outro => panic!("esperava TodosFalharam, veio {outro:?}"),
+        }
+
+        let _ = std::fs::remove_file(&caminho);
     }
 }

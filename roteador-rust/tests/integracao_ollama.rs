@@ -29,6 +29,7 @@ fn ollama_local_responde_de_verdade() {
             timeout: Duration::from_secs(120),
             habilitado: true,
         }],
+        disjuntor: Default::default(),
     };
 
     let resposta = rotear(

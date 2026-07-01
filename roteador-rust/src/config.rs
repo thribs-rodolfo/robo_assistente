@@ -42,6 +42,39 @@ pub struct ConfigProvedor {
     pub habilitado: bool,
 }
 
+/// Ajustes do disjuntor (circuit breaker) — ver [`crate::disjuntor`].
+///
+/// Bloco OPCIONAL no JSON (chave `"disjuntor"`). Ausente => `Default` = DESLIGADO, e o
+/// roteamento se comporta EXATAMENTE como antes (risco zero para quem não configura).
+/// Para ligar: `"disjuntor": {"habilitado": true}` (limiar/cooldown têm padrões sensatos).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigDisjuntor {
+    /// Liga/desliga o disjuntor. Desligado, o roteador nem lê/grava o arquivo de estado.
+    pub habilitado: bool,
+    /// Quantas falhas SEGUIDAS abrem o circuito de um provedor.
+    pub limiar_falhas: u32,
+    /// Por quantos segundos o circuito fica aberto (provedor pulado) antes do meio-aberto.
+    pub cooldown_segundos: u64,
+    /// Onde persistir o estado entre mensagens (a ponte é um processo vivo, mas o binário
+    /// pode reiniciar; o arquivo dá continuidade). Fora do repositório.
+    pub caminho_estado: String,
+}
+
+/// Caminho padrão do estado do disjuntor (fora do repositório; efêmero/operacional).
+pub const CAMINHO_ESTADO_DISJUNTOR_PADRAO: &str = "/var/log/roteador-disjuntor.estado";
+
+impl Default for ConfigDisjuntor {
+    fn default() -> Self {
+        // Padrões conservadores: desligado, e — quando ligado — 3 falhas abrem por 60s.
+        ConfigDisjuntor {
+            habilitado: false,
+            limiar_falhas: 3,
+            cooldown_segundos: 60,
+            caminho_estado: CAMINHO_ESTADO_DISJUNTOR_PADRAO.to_string(),
+        }
+    }
+}
+
 /// Configuração completa do roteador: a ordem de fallback + os provedores declarados.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -49,6 +82,8 @@ pub struct Config {
     pub ordem_fallback: Vec<String>,
     /// Provedores declarados, na ordem em que aparecem no arquivo.
     pub provedores: Vec<ConfigProvedor>,
+    /// Ajustes do disjuntor. Ausente no JSON => `Default` (desligado).
+    pub disjuntor: ConfigDisjuntor,
 }
 
 impl Config {
@@ -91,10 +126,51 @@ pub fn interpretar(texto_json: &str) -> Result<Config, ErroRoteador> {
         provedores.push(interpretar_provedor(nome, config_valor)?);
     }
 
+    let disjuntor = interpretar_disjuntor(raiz.obter("disjuntor"));
+
     Ok(Config {
         ordem_fallback,
         provedores,
+        disjuntor,
     })
+}
+
+/// Extrai o bloco `disjuntor` (opcional). Ausente ou não-objeto => `Default` (desligado).
+/// Cada campo cai no padrão quando falta, então `{"habilitado": true}` já basta para ligar.
+fn interpretar_disjuntor(valor: Option<&Valor>) -> ConfigDisjuntor {
+    let padrao = ConfigDisjuntor::default();
+    let valor = match valor {
+        Some(v) => v,
+        None => return padrao,
+    };
+
+    let habilitado = valor
+        .obter("habilitado")
+        .and_then(Valor::como_booleano)
+        .unwrap_or(padrao.habilitado);
+    // Limiar mínimo 1: "0 falhas abrem" não faz sentido (abriria sem nunca tentar).
+    let limiar_falhas = valor
+        .obter("limiar_falhas")
+        .and_then(Valor::como_numero)
+        .map(|n| (n.max(1.0)) as u32)
+        .unwrap_or(padrao.limiar_falhas);
+    let cooldown_segundos = valor
+        .obter("cooldown_segundos")
+        .and_then(Valor::como_numero)
+        .map(|n| (n.max(1.0)) as u64)
+        .unwrap_or(padrao.cooldown_segundos);
+    let caminho_estado = valor
+        .obter("caminho_estado")
+        .and_then(Valor::como_texto)
+        .map(str::to_string)
+        .unwrap_or(padrao.caminho_estado);
+
+    ConfigDisjuntor {
+        habilitado,
+        limiar_falhas,
+        cooldown_segundos,
+        caminho_estado,
+    }
 }
 
 /// Extrai um `ConfigProvedor` do objeto JSON de um provedor.
@@ -170,5 +246,45 @@ mod testes {
         let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"openai_compat","habilitado":false}}}"#;
         let config = interpretar(bruto).unwrap();
         assert!(!config.provedor("g").unwrap().habilitado);
+    }
+
+    #[test]
+    fn disjuntor_ausente_vem_desligado_por_padrao() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(!config.disjuntor.habilitado);
+        assert_eq!(config.disjuntor, ConfigDisjuntor::default());
+    }
+
+    #[test]
+    fn disjuntor_liga_e_le_campos() {
+        let bruto = r#"{
+            "ordem_fallback":["g"],
+            "provedores":{"g":{"tipo":"ollama"}},
+            "disjuntor":{"habilitado":true,"limiar_falhas":5,"cooldown_segundos":120,
+                         "caminho_estado":"/tmp/x.estado"}
+        }"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(config.disjuntor.habilitado);
+        assert_eq!(config.disjuntor.limiar_falhas, 5);
+        assert_eq!(config.disjuntor.cooldown_segundos, 120);
+        assert_eq!(config.disjuntor.caminho_estado, "/tmp/x.estado");
+    }
+
+    #[test]
+    fn disjuntor_so_com_habilitado_usa_padroes() {
+        // Ligar sem detalhar campos deve herdar limiar/cooldown padrão.
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"disjuntor":{"habilitado":true}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert!(config.disjuntor.habilitado);
+        assert_eq!(config.disjuntor.limiar_falhas, 3);
+        assert_eq!(config.disjuntor.cooldown_segundos, 60);
+    }
+
+    #[test]
+    fn disjuntor_limiar_zero_vira_um() {
+        let bruto = r#"{"ordem_fallback":["g"],"provedores":{"g":{"tipo":"ollama"}},"disjuntor":{"habilitado":true,"limiar_falhas":0}}"#;
+        let config = interpretar(bruto).unwrap();
+        assert_eq!(config.disjuntor.limiar_falhas, 1);
     }
 }
