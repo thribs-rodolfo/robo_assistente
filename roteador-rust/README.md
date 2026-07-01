@@ -263,6 +263,26 @@ cadeia NÃO pagou** — é a economia do disjuntor virando número:
 
 Com o disjuntor desligado (padrão) não há pulos e essas linhas nem aparecem.
 
+### Disjuntor em sombra (decisão de ligar viralizada em número)
+
+Quando o disjuntor roda em [modo sombra](#modo-sombra-sombra-true--a-rampa-de-confiança), ele
+loga por mensagem o que FARIA (`[disjuntor-sombra] ...`). As métricas AGREGAM essas linhas para
+transformar a decisão de ligar o disjuntor em números de uma olhada, em vez de `grep` linha a linha:
+
+```
+# disjuntor em sombra: pularia 2 certo(s) (~8100ms poupados), 0 falso(s) positivo(s)
+#   → sem falsos positivos: candidato a ligar o disjuntor
+```
+
+- **pularia N certo(s)**: pulos que o disjuntor ativo acertaria (previu falha e o provedor falhou).
+- **~Xms poupados**: a latência de provedor morto que ele teria poupado — a economia projetada
+  sobre o tráfego real, ANTES de ligar.
+- **M falso(s) positivo(s)**: vezes que pularia um provedor que na verdade RESPONDEU. `M = 0` →
+  "candidato a ligar"; `M > 0` → "NÃO ligar ainda / subir limiar/cooldown". É o freio.
+
+No `--json`: campos `sombra_pularia_ok`, `sombra_economia_ms`, `sombra_falsos_positivos` por
+provedor e no topo. Sem atividade de sombra (caso comum), nada disso aparece.
+
 ### Retentativas (instabilidade absorvida)
 
 Quando a [retentativa](#retentativa-em-falhas-transitórias-retentativas) está ligada e um
