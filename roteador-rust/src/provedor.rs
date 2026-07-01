@@ -4,7 +4,7 @@
 //! Groq ou Gemini. Ele só conhece o trait `Provedor`. Trocar/adicionar provedor é
 //! implementar o trait e citar o nome na `ordem_fallback`.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -155,28 +155,64 @@ impl Provedor for ProvedorClaudeCli {
             .spawn()
             .map_err(|e| FalhaProvedor::Processo(format!("não subiu '{comando}': {e}")))?;
 
-        // Escreve o prompt no stdin e fecha (o `take` move o stdin pra fora do filho, e o
-        // drop ao fim deste bloco fecha o pipe — sinaliza "fim da entrada" ao processo).
-        {
-            let stdin = filho
-                .stdin
-                .take()
-                .ok_or_else(|| FalhaProvedor::Processo("sem stdin no processo".into()))?;
+        // Tomamos posse dos três canos. Precisamos DRENAR stdout e stderr enquanto o
+        // processo ainda roda: se a resposta do Claude passar do buffer do pipe do SO
+        // (~64 KB), o processo BLOQUEIA escrevendo no stdout à espera de um leitor. Se só
+        // fôssemos ler DEPOIS que ele terminasse, ele nunca terminaria (deadlock clássico)
+        // e nós o mataríamos por "timeout" — perdendo uma resposta longa perfeitamente boa.
+        // Por isso cada cano ganha sua própria thread, drenando em paralelo à espera.
+        let stdin = filho
+            .stdin
+            .take()
+            .ok_or_else(|| FalhaProvedor::Processo("sem stdin no processo".into()))?;
+        let stdout = filho
+            .stdout
+            .take()
+            .ok_or_else(|| FalhaProvedor::Processo("sem stdout no processo".into()))?;
+        let stderr = filho
+            .stderr
+            .take()
+            .ok_or_else(|| FalhaProvedor::Processo("sem stderr no processo".into()))?;
+
+        // Thread de ESCRITA: manda o prompt e fecha o stdin (o `drop` do `stdin` ao fim
+        // fecha o cano, sinalizando "fim da entrada"). Em thread para nunca travar caso o
+        // buffer de stdin encha antes de o processo começar a ler.
+        let prompt_bytes = prompt_texto.into_bytes();
+        let escritor = std::thread::spawn(move || -> std::io::Result<()> {
             let mut stdin = stdin;
-            stdin
-                .write_all(prompt_texto.as_bytes())
-                .map_err(|e| FalhaProvedor::Processo(format!("falha ao escrever no stdin: {e}")))?;
-        }
+            stdin.write_all(&prompt_bytes)?;
+            Ok(()) // o drop de `stdin` aqui fecha o cano
+        });
+
+        // Threads de LEITURA: cada uma lê seu cano até o EOF (que chega quando o processo
+        // termina ou é morto). Devolvem os bytes lidos.
+        let leitor_stdout = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut stdout = stdout;
+            let mut buffer = Vec::new();
+            stdout.read_to_end(&mut buffer)?;
+            Ok(buffer)
+        });
+        let leitor_stderr = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut stderr = stderr;
+            let mut buffer = Vec::new();
+            stderr.read_to_end(&mut buffer)?;
+            Ok(buffer)
+        });
 
         // Espera com timeout próprio (a stdlib não tem wait com prazo): consultamos
-        // `try_wait` em laço curto até o processo terminar ou estourar o tempo.
+        // `try_wait` num laço curto até o processo terminar ou estourar o tempo.
         let prazo = Instant::now() + self.config.timeout;
-        loop {
+        let status = loop {
             match filho.try_wait() {
-                Ok(Some(_)) => break, // terminou
+                Ok(Some(status)) => break status, // terminou
                 Ok(None) => {
                     if Instant::now() >= prazo {
-                        // Estourou: mata o processo para não deixar órfão e reporta a falha.
+                        // Estourou: mata o processo (que é o `claude` direto — sem shell no
+                        // meio) e o reapa para não virar zumbi. Ao morrer, seus canos fecham
+                        // e as threads de leitura chegam ao EOF sozinhas. NÃO as juntamos
+                        // aqui de propósito: se o processo tivesse deixado um neto segurando
+                        // o cano, o `join` travaria o caminho da mensagem viva. Largamos as
+                        // handles (as threads se desprendem e terminam quando o cano fechar).
                         let _ = filho.kill();
                         let _ = filho.wait();
                         return Err(FalhaProvedor::Processo("estourou o timeout".into()));
@@ -185,21 +221,41 @@ impl Provedor for ProvedorClaudeCli {
                 }
                 Err(e) => return Err(FalhaProvedor::Processo(format!("erro ao aguardar: {e}"))),
             }
+        };
+
+        // Junta as threads e colhe o que cada cano produziu. `join` devolve o `Result` da
+        // thread; um cano que falhou na leitura vira FalhaProvedor (nada de erro silencioso).
+        let saida_stdout = leitor_stdout
+            .join()
+            .map_err(|_| FalhaProvedor::Processo("thread de stdout entrou em pânico".into()))?
+            .map_err(|e| FalhaProvedor::Processo(format!("falha ao ler stdout: {e}")))?;
+        let saida_stderr = leitor_stderr
+            .join()
+            .map_err(|_| FalhaProvedor::Processo("thread de stderr entrou em pânico".into()))?
+            .map_err(|e| FalhaProvedor::Processo(format!("falha ao ler stderr: {e}")))?;
+        // A escrita do stdin pode ter dado "broken pipe" se o processo morreu cedo; nesse
+        // caso o motivo real está no status/stderr abaixo, então só reportamos o erro de
+        // escrita quando ele NÃO for um cano quebrado (para não mascarar a causa raiz).
+        let escrita = escritor
+            .join()
+            .map_err(|_| FalhaProvedor::Processo("thread de stdin entrou em pânico".into()))?;
+        if let Err(e) = &escrita {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(FalhaProvedor::Processo(format!(
+                    "falha ao escrever no stdin: {e}"
+                )));
+            }
         }
 
-        // Coleta a saída completa (já terminou, então o read não bloqueia).
-        let saida = filho
-            .wait_with_output()
-            .map_err(|e| FalhaProvedor::Processo(format!("falha ao coletar saída: {e}")))?;
-        if !saida.status.success() {
-            let erro = String::from_utf8_lossy(&saida.stderr);
+        if !status.success() {
+            let erro = String::from_utf8_lossy(&saida_stderr);
             return Err(FalhaProvedor::Processo(format!(
                 "código {:?}: {}",
-                saida.status.code(),
+                status.code(),
                 erro.trim()
             )));
         }
-        let texto = String::from_utf8_lossy(&saida.stdout).trim().to_string();
+        let texto = String::from_utf8_lossy(&saida_stdout).trim().to_string();
         if texto.is_empty() {
             return Err(FalhaProvedor::RespostaVazia);
         }
@@ -433,5 +489,92 @@ mod testes {
             provedor.disponivel(),
             Err(FalhaProvedor::Indisponivel(_))
         ));
+    }
+
+    // ----------------------------------------------------------------------- //
+    // Testes do provedor Claude CLI usando um PROGRAMA FALSO no lugar do `claude`.
+    // Nunca disparam o Claude de verdade (licao-refresh-token-rotativo): o campo
+    // `comando` aponta para um script de shell temporário que geramos aqui.
+    // ----------------------------------------------------------------------- //
+    #[cfg(unix)]
+    fn escrever_script_temporario(corpo: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Nome único por processo + contador (sem relógio/aleatório, para ser determinístico).
+        static CONTADOR: AtomicU64 = AtomicU64::new(0);
+        let sequencia = CONTADOR.fetch_add(1, Ordering::Relaxed);
+        let caminho = std::env::temp_dir().join(format!(
+            "roteador-fake-claude-{}-{}.sh",
+            std::process::id(),
+            sequencia
+        ));
+        let mut arquivo = std::fs::File::create(&caminho).expect("cria script temporário");
+        arquivo
+            .write_all(corpo.as_bytes())
+            .expect("escreve script temporário");
+        // Marca executável (0o755) — sem isso o `Command::spawn` falha com "permission denied".
+        std::fs::set_permissions(&caminho, std::fs::Permissions::from_mode(0o755))
+            .expect("torna script executável");
+        caminho
+    }
+
+    #[cfg(unix)]
+    fn config_claude_com(comando: std::path::PathBuf, timeout: Duration) -> ConfigProvedor {
+        ConfigProvedor {
+            nome: "claude-fake".into(),
+            tipo: "claude_cli".into(),
+            url_base: None,
+            modelo: None,
+            comando: Some(comando.to_string_lossy().into_owned()),
+            chave: None,
+            timeout,
+            habilitado: true,
+            retentativas: 0,
+            retentativa_espera_ms: 250,
+        }
+    }
+
+    /// Regressão do deadlock de pipe: uma resposta MAIOR que o buffer do pipe do SO
+    /// (~64 KB) deve voltar inteira. Antes de drenar stdout em thread, isto travava e caía
+    /// num falso "timeout". O script ignora `--print`, ignora o stdin e cospe ~200 KB.
+    #[cfg(unix)]
+    #[test]
+    fn claude_cli_le_resposta_maior_que_o_buffer_do_pipe() {
+        let script = escrever_script_temporario(
+            "#!/bin/sh\n# ignora $1 (--print); gera ~200 KB de 'x' no stdout e sai 0.\nhead -c 200000 /dev/zero | tr '\\0' x\n",
+        );
+        let config = config_claude_com(script.clone(), Duration::from_secs(10));
+        let provedor = construir(&config).expect("constrói provedor claude falso");
+
+        let resultado = provedor.responder("oi", &Contexto::default());
+        let _ = std::fs::remove_file(&script);
+
+        let texto = resultado.expect("resposta longa deve voltar inteira, sem deadlock/timeout");
+        assert_eq!(texto.len(), 200_000, "todo o stdout deve ser lido");
+        assert!(texto.chars().all(|c| c == 'x'));
+    }
+
+    /// O timeout continua matando um processo lento (sem deixá-lo órfão) e devolvendo falha.
+    #[cfg(unix)]
+    #[test]
+    fn claude_cli_mata_processo_que_estoura_o_timeout() {
+        // `exec` faz o shell VIRAR o sleep (sem neto), modelando o `claude` como filho
+        // direto — assim o kill do timeout fecha o cano na hora, igual à produção.
+        let script = escrever_script_temporario("#!/bin/sh\nexec sleep 30\n");
+        let config = config_claude_com(script.clone(), Duration::from_millis(300));
+        let provedor = construir(&config).expect("constrói provedor claude falso");
+
+        let resultado = provedor.responder("oi", &Contexto::default());
+        let _ = std::fs::remove_file(&script);
+
+        match resultado {
+            Err(FalhaProvedor::Processo(msg)) => assert!(
+                msg.contains("timeout"),
+                "esperava falha de timeout, veio: {msg}"
+            ),
+            outro => panic!("esperava FalhaProvedor::Processo(timeout), veio: {outro:?}"),
+        }
     }
 }

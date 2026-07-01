@@ -209,6 +209,19 @@ de 5s, pois estamos no caminho de uma mensagem viva). Cada retentativa sai na te
 tentativa só, comportamento idêntico ao de antes, sem latência extra. Campos (por provedor,
 opcionais): `retentativas` (0), `retentativa_espera_ms` (250).
 
+## Provedor Claude CLI: leitura de resposta longa sem deadlock
+
+O `ProvedorClaudeCli` fala com o `claude --print` por pipes de `stdin`/`stdout`. O buffer de
+pipe do SO é pequeno (~64 KB): se a resposta do Claude passa disso e ninguém está **lendo** o
+`stdout`, o processo **bloqueia escrevendo** e nunca termina. Ler o `stdout` só *depois* de o
+processo sair (o padrão ingênuo) causa **deadlock** — e o roteador o mataria por falso
+"timeout", perdendo uma resposta longa boa. Por isso cada cano ganha sua **própria thread**
+(escrita do prompt, leitura de `stdout`, leitura de `stderr`), drenando em paralelo à espera do
+`try_wait` com prazo. No timeout, o processo é morto e as threads se desprendem (nunca damos
+`join` que pudesse travar o caminho da mensagem viva). Coberto por dois testes com um `claude`
+**falso** (um script de shell temporário; o Claude real nunca é disparado): resposta de ~200 KB
+volta inteira, e um processo lento é morto no prazo.
+
 ## Uso
 
 ```sh
